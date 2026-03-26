@@ -1,10 +1,10 @@
 name: Sync Code Evidence
 
 on:
-  push:
+ workflow_dispatch:
+ push:
     branches:
-      - main
-      - develop
+      - master
 
 permissions:
   contents: read
