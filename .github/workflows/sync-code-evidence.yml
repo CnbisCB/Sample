@@ -27,11 +27,11 @@ jobs:
 
       - name: Create Codebeamer item from one comment
         env:
-          CB_BASE_URL: ${{ secrets.CB_BASE_URL }}
-          CB_USERNAME: ${{ secrets.CB_USERNAME }}
-          CB_PASSWORD: ${{ secrets.CB_PASSWORD }}
-          CB_TRACKER_ID: ${{ secrets.CB_TRACKER_ID }}
-          CB_COMPONENT_ITEM_ID: ${{ secrets.CB_COMPONENT_ITEM_ID }}
+          CB_BASE_URL: http://cbcnbis.com:8080
+          CB_USERNAME: admin
+          CB_PASSWORD: Cnbis123!
+          CB_TRACKER_ID: 146182
+          CB_COMPONENT_TRACKER_ID: 122808
 
           CB_FIELD_REPOSITORY: ${{ secrets.CB_FIELD_REPOSITORY }}
           CB_FIELD_FILE_PATH: ${{ secrets.CB_FIELD_FILE_PATH }}
