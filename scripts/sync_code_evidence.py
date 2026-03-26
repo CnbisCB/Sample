@@ -235,7 +235,7 @@ def resolve_component_item_id(component_tracker_id: int, component_key: str) -> 
     page_size = 500
 
     while True:
-        url = f"{base_url}/v3/trackers/{component_tracker_id}/items?page={page}&pageSize={page_size}"
+        url = f"{base_url}/v3/trackers/{component_tracker_id}/items"
         data = request_json("GET", url, auth=auth)
 
         item_refs = []
