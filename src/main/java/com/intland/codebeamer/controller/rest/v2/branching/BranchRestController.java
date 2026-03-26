@@ -172,6 +172,7 @@ public class BranchRestController extends AbstractUserAwareRestController {
 		private final TrackerDto tracker;
 		private final BranchDto branch;
 		private final UserDto user;
+/* CB_COMPONENT_TRACKER: SWDD */
 /* CB_COMPONENT: SWDD-001 */
 /* CB_SCOPE: Diag_Process */
 		public BranchCreationContext(CreateBranchModel branchModel, UserDto user) throws ResourceNotFoundException, BadRequestException, ResourceForbiddenException {
