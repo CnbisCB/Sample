@@ -166,7 +166,8 @@ public class BranchRestController extends AbstractUserAwareRestController {
 				.map(this.trackerReferenceConverter::convert)
 				.collect(Collectors.toList());
 	}
-
+/* CB_COMPONENT: SWDD-001 */
+/* CB_SCOPE: Diag_Process */
 	private class BranchCreationContext {
 		private final CreateBranchModel branchModel;
 		private final TrackerDto tracker;
