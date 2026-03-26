@@ -25,7 +25,7 @@ def find_target_comment_and_function(repo_root: Path):
     for file_path in repo_root.rglob("*"):
         if not file_path.is_file():
             continue
-        if file_path.suffix.lower() not in {".c", ".cpp", ".cc", ".h", ".hpp"}:
+        if file_path.suffix.lower() not in {".c", ".cpp", ".cc", ".h", ".hpp", ".java"}:
             continue
 
         text = file_path.read_text(encoding="utf-8", errors="ignore")
