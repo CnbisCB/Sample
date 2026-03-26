@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 import requests
 
 
-COMMENT_COMPONENT_RE = re.compile(r"CB_COMPONENT:\s*([A-Za-z0-9._-]+)")
+COMMENT_COMPONENT_ID_RE = re.compile(r"CB_COMPONENT_ID:\s*(\d+)")
 COMMENT_SCOPE_RE = re.compile(r"CB_SCOPE:\s*([A-Za-z0-9_./-]+)")
 SUPPORTED_SUFFIXES = {".java", ".c", ".cpp", ".cc", ".h", ".hpp"}
 
@@ -16,13 +16,6 @@ def require_env(name: str) -> str:
     value = os.environ.get(name)
     if value is None or value == "":
         raise RuntimeError(f"Required environment variable is missing: {name}")
-    return value
-
-
-def optional_env(name: str, default: Optional[str] = None) -> Optional[str]:
-    value = os.environ.get(name)
-    if value is None or value == "":
-        return default
     return value
 
 
@@ -60,31 +53,26 @@ def is_comment_line(line: str) -> bool:
 
 
 def find_annotation_block(lines: List[str]) -> Optional[Dict[str, Any]]:
-    """
-    CB_COMPONENT, CB_SCOPE 주석 블록 찾기
-    """
     for i in range(len(lines)):
-        component_value = None
+        component_item_id = None
         scope_value = None
         last_annotation_idx = None
 
         for j in range(i, min(i + 6, len(lines))):
-            component_match = COMMENT_COMPONENT_RE.search(lines[j])
+            component_match = COMMENT_COMPONENT_ID_RE.search(lines[j])
             scope_match = COMMENT_SCOPE_RE.search(lines[j])
 
             if component_match:
-                component_value = component_match.group(1).strip()
+                component_item_id = int(component_match.group(1).strip())
                 last_annotation_idx = j
 
             if scope_match:
                 scope_value = scope_match.group(1).strip()
                 last_annotation_idx = j
 
-            if component_value and scope_value:
-                component_tracker_key = component_value.split("-")[0] if "-" in component_value else None
+            if component_item_id and scope_value:
                 return {
-                    "component_tracker_key": component_tracker_key,
-                    "component_key": component_value,
+                    "component_item_id": component_item_id,
                     "scope_name": scope_value,
                     "annotation_end_index": last_annotation_idx,
                 }
@@ -93,9 +81,6 @@ def find_annotation_block(lines: List[str]) -> Optional[Dict[str, Any]]:
 
 
 def find_block_after_annotation(lines: List[str], annotation_end_index: int) -> Optional[Dict[str, int]]:
-    """
-    주석 아래 첫 코드 블록(메서드/생성자/클래스 등)의 시작/끝 라인 계산
-    """
     start_idx = None
     first_open_brace_seen = False
     brace_balance = 0
@@ -130,8 +115,8 @@ def find_block_after_annotation(lines: List[str], annotation_end_index: int) -> 
 
             if brace_balance == 0:
                 return {
-                    "start_line": start_idx + 1,  # 1-based
-                    "end_line": k + 1,            # 1-based
+                    "start_line": start_idx + 1,
+                    "end_line": k + 1,
                 }
 
     return None
@@ -159,15 +144,14 @@ def find_target_comment_and_block(repo_root: Path) -> Dict[str, Any]:
         relative_path = file_path.relative_to(repo_root).as_posix()
 
         return {
-            "component_tracker_key": annotation["component_tracker_key"],
-            "component_key": annotation["component_key"],
+            "component_item_id": annotation["component_item_id"],
             "scope_name": annotation["scope_name"],
             "file_path": relative_path,
             "start_line": block["start_line"],
             "end_line": block["end_line"],
         }
 
-    raise RuntimeError("CB_COMPONENT / CB_SCOPE 주석 쌍을 찾지 못했습니다.")
+    raise RuntimeError("CB_COMPONENT_ID / CB_SCOPE 주석 쌍을 찾지 못했습니다.")
 
 
 def build_permalink(
@@ -196,14 +180,9 @@ def get_tracker_fields(tracker_id: int) -> List[Dict[str, Any]]:
     auth = get_auth()
     url = f"{base_url}/v3/trackers/{tracker_id}/fields"
     return request_json("GET", url, auth=auth)
-    debug("Component tracker response keys", list(data.keys()) if isinstance(data, dict) else type(data))
 
 
 def resolve_field_id(tracker_id: int, env_name: str) -> int:
-    """
-    Secret 값이 숫자면 그대로 fieldId로 사용.
-    숫자가 아니면 field name으로 간주하고 /fields에서 찾아서 id로 변환.
-    """
     raw = require_env(env_name).strip()
 
     if raw.isdigit():
@@ -223,67 +202,11 @@ def resolve_field_id(tracker_id: int, env_name: str) -> int:
     )
 
 
-def resolve_component_item_id(component_tracker_id: int, component_key: str) -> int:
-    """
-    component_key 예: SWDD-001
-    /v3/trackers/{trackerId}/items 로 목록을 가져와서 key/name 에서 찾음
-    """
-    base_url = get_base_url()
-    auth = get_auth()
-
-    page = 1
-    page_size = 500
-
-    while True:
-        url = f"{base_url}/v3/trackers/{component_tracker_id}/items"
-        data = request_json("GET", url, auth=auth)
-
-        item_refs = []
-        if isinstance(data, dict):
-            # 환경별로 items 또는 itemRefs 형태가 다를 수 있어 둘 다 대응
-            item_refs = data.get("items") or data.get("itemRefs") or []
-
-        debug(f"Component tracker page {page} item count", len(item_refs))
-
-        if not item_refs:
-            break
-
-        for item in item_refs:
-            item_id = item.get("id")
-            item_name = item.get("name", "")
-            item_key = item.get("key", "")
-
-            # key가 내려오면 key 우선 비교
-            if item_key == component_key:
-                return int(item_id)
-
-            # key가 안 내려오는 환경이면 name에 SWDD-001 이 포함되는지 확인
-            if item_name == component_key or component_key in item_name:
-                return int(item_id)
-
-        total = data.get("total") if isinstance(data, dict) else None
-        if total is not None and page * page_size >= total:
-            break
-
-        page += 1
-
-    raise RuntimeError(
-        f"Component item not found in tracker {component_tracker_id}: {component_key}"
-    )
-
-
 def create_codebeamer_item(data: Dict[str, Any]) -> None:
     base_url = get_base_url()
     auth = get_auth()
 
     tracker_id = int(require_env("CB_TRACKER_ID"))
-    component_tracker_id = int(require_env("CB_COMPONENT_TRACKER_ID"))
-
-    debug("USING ENV CB_COMPONENT_TRACKER_ID", component_tracker_id)
-
-    component_item_id = resolve_component_item_id(component_tracker_id, data["component_key"])
-
-    debug("RESOLVED COMPONENT ITEM ID", component_item_id)
 
     field_repository = resolve_field_id(tracker_id, "CB_FIELD_REPOSITORY")
     field_file_path = resolve_field_id(tracker_id, "CB_FIELD_FILE_PATH")
@@ -347,8 +270,7 @@ def create_codebeamer_item(data: Dict[str, Any]) -> None:
                 "type": "ChoiceFieldValue",
                 "values": [
                     {
-                        "id": component_item_id,
-                        "name": data["component_key"],
+                        "id": data["component_item_id"],
                         "type": "TrackerItemReference",
                     }
                 ],
@@ -384,7 +306,6 @@ def main() -> None:
         "CB_USERNAME exists": bool(os.environ.get("CB_USERNAME")),
         "CB_PASSWORD exists": bool(os.environ.get("CB_PASSWORD")),
         "CB_TRACKER_ID exists": bool(os.environ.get("CB_TRACKER_ID")),
-        "CB_COMPONENT_TRACKER_ID exists": bool(os.environ.get("CB_COMPONENT_TRACKER_ID")),
     })
 
     found = find_target_comment_and_block(repo_root)
@@ -404,8 +325,7 @@ def main() -> None:
     )
 
     payload_data = {
-        "component_tracker_key": found["component_tracker_key"],
-        "component_key": found["component_key"],
+        "component_item_id": found["component_item_id"],
         "scope_name": found["scope_name"],
         "file_path": found["file_path"],
         "start_line": found["start_line"],
