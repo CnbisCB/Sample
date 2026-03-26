@@ -33,14 +33,14 @@ jobs:
           CB_TRACKER_ID: 146182
           CB_COMPONENT_TRACKER_ID: 122808
 
-          CB_FIELD_REPOSITORY: 146182
-          CB_FIELD_FILE_PATH: 146182
-          CB_FIELD_START_LINE: 146182
-          CB_FIELD_END_LINE: 146182
-          CB_FIELD_SCOPE_NAME: 146182
-          CB_FIELD_COMMIT_SHA: 146182
-          CB_FIELD_PERMALINK: 146182
-          CB_FIELD_LINKED_COMPONENT: 146182
+          CB_FIELD_REPOSITORY: Repository Name
+          CB_FIELD_FILE_PATH: File Path
+          CB_FIELD_START_LINE: Start Line
+          CB_FIELD_END_LINE: End Line
+          CB_FIELD_SCOPE_NAME: Scope Name
+          CB_FIELD_COMMIT_SHA: Commit SHA
+          CB_FIELD_PERMALINK: GitHub Permalink
+          CB_FIELD_LINKED_COMPONENT: Linked Component
           
           GITHUB_SERVER_URL: ${{ github.server_url }}
           GITHUB_REPOSITORY: ${{ github.repository }}
