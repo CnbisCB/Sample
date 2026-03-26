@@ -1,1 +1,48 @@
+name: Sync Code Evidence
 
+on:
+  push:
+    branches:
+      - main
+      - develop
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install requests
+        run: pip install requests
+
+      - name: Create Codebeamer item from one comment
+        env:
+          CB_BASE_URL: ${{ secrets.CB_BASE_URL }}
+          CB_USERNAME: ${{ secrets.CB_USERNAME }}
+          CB_PASSWORD: ${{ secrets.CB_PASSWORD }}
+          CB_TRACKER_ID: ${{ secrets.CB_TRACKER_ID }}
+          CB_COMPONENT_ITEM_ID: ${{ secrets.CB_COMPONENT_ITEM_ID }}
+
+          CB_FIELD_REPOSITORY: ${{ secrets.CB_FIELD_REPOSITORY }}
+          CB_FIELD_FILE_PATH: ${{ secrets.CB_FIELD_FILE_PATH }}
+          CB_FIELD_START_LINE: ${{ secrets.CB_FIELD_START_LINE }}
+          CB_FIELD_END_LINE: ${{ secrets.CB_FIELD_END_LINE }}
+          CB_FIELD_SCOPE_NAME: ${{ secrets.CB_FIELD_SCOPE_NAME }}
+          CB_FIELD_COMMIT_SHA: ${{ secrets.CB_FIELD_COMMIT_SHA }}
+          CB_FIELD_PERMALINK: ${{ secrets.CB_FIELD_PERMALINK }}
+          CB_FIELD_LINKED_COMPONENT: ${{ secrets.CB_FIELD_LINKED_COMPONENT }}
+
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: python /scripts/sync_code_evidence.py
