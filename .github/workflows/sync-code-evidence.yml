@@ -45,4 +45,4 @@ jobs:
           GITHUB_SERVER_URL: ${{ github.server_url }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_SHA: ${{ github.sha }}
-        run: python /scripts/sync_code_evidence.py
+        run: python scripts/sync_code_evidence.py
