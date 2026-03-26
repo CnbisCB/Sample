@@ -166,14 +166,14 @@ public class BranchRestController extends AbstractUserAwareRestController {
 				.map(this.trackerReferenceConverter::convert)
 				.collect(Collectors.toList());
 	}
-/* CB_COMPONENT: SWDD-001 */
-/* CB_SCOPE: Diag_Process */
+
 	private class BranchCreationContext {
 		private final CreateBranchModel branchModel;
 		private final TrackerDto tracker;
 		private final BranchDto branch;
 		private final UserDto user;
-
+/* CB_COMPONENT: SWDD-001 */
+/* CB_SCOPE: Diag_Process */
 		public BranchCreationContext(CreateBranchModel branchModel, UserDto user) throws ResourceNotFoundException, BadRequestException, ResourceForbiddenException {
 			this.branchModel = branchModel;
 			this.user = user;
