@@ -2,10 +2,12 @@ import os
 import re
 import json
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Set
 
 import requests
 
 
+COMMENT_COMPONENT_TRACKER_RE = re.compile(r"CB_COMPONENT_TRACKER:\s*([A-Za-z0-9._-]+)")
 COMMENT_COMPONENT_RE = re.compile(r"CB_COMPONENT:\s*([A-Za-z0-9._-]+)")
 COMMENT_SCOPE_RE = re.compile(r"CB_SCOPE:\s*([A-Za-z0-9_./-]+)")
 
@@ -19,6 +21,10 @@ def require_env(name: str) -> str:
     return value
 
 
+def get_env(name: str, default: Optional[str] = None) -> Optional[str]:
+    return os.environ.get(name, default)
+
+
 def is_comment_line(line: str) -> bool:
     stripped = line.strip()
     return (
@@ -29,20 +35,80 @@ def is_comment_line(line: str) -> bool:
     )
 
 
-def find_annotation_block(lines):
-    """
-    주석 2줄(CB_COMPONENT, CB_SCOPE)을 찾고,
-    그 주석 블록이 끝나는 line index를 반환.
-    """
+def debug(title: str, value: Any) -> None:
+    print(f"=== {title} ===")
+    if isinstance(value, (dict, list)):
+        print(json.dumps(value, indent=2, ensure_ascii=False))
+    else:
+        print(value)
+
+
+def safe_json(resp: requests.Response) -> Any:
+    try:
+        return resp.json()
+    except Exception:
+        return resp.text
+
+
+def request_json(method: str, url: str, *, auth: tuple[str, str], **kwargs) -> Any:
+    resp = requests.request(method, url, auth=auth, timeout=60, **kwargs)
+    debug(f"{method} {url} - STATUS", resp.status_code)
+    debug(f"{method} {url} - BODY", safe_json(resp))
+    resp.raise_for_status()
+    return safe_json(resp)
+
+
+def normalize_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def collect_items_from_response(data: Any) -> List[Dict[str, Any]]:
+    if isinstance(data, list):
+        return [x for x in data if isinstance(x, dict)]
+
+    if not isinstance(data, dict):
+        return []
+
+    for key in ("items", "itemRefs", "trackerItems", "references", "content", "results"):
+        value = data.get(key)
+        if isinstance(value, list):
+            return [x for x in value if isinstance(x, dict)]
+
+    return []
+
+
+def collect_trackers_from_response(data: Any) -> List[Dict[str, Any]]:
+    if isinstance(data, list):
+        return [x for x in data if isinstance(x, dict)]
+
+    if not isinstance(data, dict):
+        return []
+
+    for key in ("trackers", "items", "content", "results"):
+        value = data.get(key)
+        if isinstance(value, list):
+            return [x for x in value if isinstance(x, dict)]
+
+    return []
+
+
+def find_annotation_block(lines: List[str]) -> Optional[Dict[str, Any]]:
     for i in range(len(lines)):
+        tracker_value = None
         component_value = None
         scope_value = None
         last_annotation_idx = None
 
-        # 주석 2줄이 꼭 바로 붙어있지 않아도 되도록, 최대 5줄 정도 탐색
-        for j in range(i, min(i + 5, len(lines))):
-            component_match = COMMENT_COMPONENT_RE.search(lines[j])
-            scope_match = COMMENT_SCOPE_RE.search(lines[j])
+        for j in range(i, min(i + 8, len(lines))):
+            line = lines[j]
+
+            tracker_match = COMMENT_COMPONENT_TRACKER_RE.search(line)
+            component_match = COMMENT_COMPONENT_RE.search(line)
+            scope_match = COMMENT_SCOPE_RE.search(line)
+
+            if tracker_match:
+                tracker_value = tracker_match.group(1).strip()
+                last_annotation_idx = j
 
             if component_match:
                 component_value = component_match.group(1).strip()
@@ -52,8 +118,9 @@ def find_annotation_block(lines):
                 scope_value = scope_match.group(1).strip()
                 last_annotation_idx = j
 
-            if component_value and scope_value:
+            if tracker_value and component_value and scope_value:
                 return {
+                    "component_tracker_key": tracker_value,
                     "component_key": component_value,
                     "scope_name": scope_value,
                     "annotation_end_index": last_annotation_idx,
@@ -62,18 +129,13 @@ def find_annotation_block(lines):
     return None
 
 
-def find_block_after_annotation(lines, annotation_end_index):
-    """
-    주석 아래 첫 코드 블록(메서드/생성자/클래스 등)의 시작~끝 라인을 계산
-    """
+def find_block_after_annotation(lines: List[str], annotation_end_index: int) -> Optional[Dict[str, int]]:
     start_idx = None
     first_open_brace_seen = False
     brace_balance = 0
 
-    # 주석 아래로 내려가면서 첫 선언 시작 찾기
     for j in range(annotation_end_index + 1, len(lines)):
-        line = lines[j]
-        stripped = line.strip()
+        stripped = lines[j].strip()
 
         if not stripped:
             continue
@@ -87,10 +149,8 @@ def find_block_after_annotation(lines, annotation_end_index):
     if start_idx is None:
         return None
 
-    # 시작 줄부터 블록 닫힐 때까지 brace 계산
     for k in range(start_idx, len(lines)):
         line = lines[k]
-
         open_count = line.count("{")
         close_count = line.count("}")
 
@@ -103,14 +163,14 @@ def find_block_after_annotation(lines, annotation_end_index):
 
             if brace_balance == 0:
                 return {
-                    "start_line": start_idx + 1,  # 1-based
-                    "end_line": k + 1,            # 1-based
+                    "start_line": start_idx + 1,
+                    "end_line": k + 1,
                 }
 
     return None
 
 
-def find_target_comment_and_function(repo_root: Path):
+def find_target_comment_and_block(repo_root: Path) -> Dict[str, Any]:
     for file_path in repo_root.rglob("*"):
         if not file_path.is_file():
             continue
@@ -132,6 +192,7 @@ def find_target_comment_and_function(repo_root: Path):
         relative_path = file_path.relative_to(repo_root).as_posix()
 
         return {
+            "component_tracker_key": annotation["component_tracker_key"],
             "component_key": annotation["component_key"],
             "scope_name": annotation["scope_name"],
             "file_path": relative_path,
@@ -139,18 +200,103 @@ def find_target_comment_and_function(repo_root: Path):
             "end_line": block["end_line"],
         }
 
-    raise RuntimeError("CB_COMPONENT / CB_SCOPE 주석 쌍을 찾지 못했습니다.")
+    raise RuntimeError("CB_COMPONENT_TRACKER / CB_COMPONENT / CB_SCOPE 주석 쌍을 찾지 못했습니다.")
 
 
 def build_permalink(server_url: str, repository: str, sha: str, file_path: str, start_line: int, end_line: int) -> str:
     return f"{server_url}/{repository}/blob/{sha}/{file_path}#L{start_line}-L{end_line}"
 
 
-def create_codebeamer_item(data: dict):
-    base_url = require_env("CB_BASE_URL").rstrip("/")
+def get_auth() -> tuple[str, str]:
     username = require_env("CB_USERNAME")
     password = require_env("CB_PASSWORD")
-    tracker_id = require_env("CB_TRACKER_ID")
+    return username, password
+
+
+def get_base_url() -> str:
+    return require_env("CB_BASE_URL").rstrip("/")
+
+
+def resolve_component_tracker_id(component_tracker_key: str) -> int:
+    base_url = get_base_url()
+    auth = get_auth()
+
+    manual_tracker_id = get_env("CB_COMPONENT_TRACKER_ID")
+    if manual_tracker_id:
+        debug("USING ENV CB_COMPONENT_TRACKER_ID", manual_tracker_id)
+        return int(manual_tracker_id)
+
+    url = f"{base_url}/v3/trackers"
+    data = request_json("GET", url, auth=auth)
+    trackers = collect_trackers_from_response(data)
+
+    if not trackers:
+        raise RuntimeError("No trackers returned from Codebeamer /v3/trackers")
+
+    normalized_target = component_tracker_key.strip().lower()
+
+    for tracker in trackers:
+        tracker_id = tracker.get("id")
+        name = normalize_text(tracker.get("name")).lower()
+        key = normalize_text(tracker.get("key")).lower()
+        tracker_type = normalize_text(tracker.get("type")).lower()
+
+        candidates: Set[str] = {name, key, tracker_type}
+        if normalized_target in candidates:
+            if not tracker_id:
+                raise RuntimeError(f"Tracker found but id missing for tracker key: {component_tracker_key}")
+            return int(tracker_id)
+
+    raise RuntimeError(f"Component tracker not found in Codebeamer: {component_tracker_key}")
+
+
+def resolve_component_item_id(component_tracker_id: int, component_key: str) -> int:
+    base_url = get_base_url()
+    auth = get_auth()
+
+    url = f"{base_url}/v3/trackers/{component_tracker_id}/items"
+    data = request_json("GET", url, auth=auth)
+    items = collect_items_from_response(data)
+
+    if not items:
+        raise RuntimeError(f"No items returned from tracker: {component_tracker_id}")
+
+    normalized_target = component_key.strip().lower()
+
+    for item in items:
+        item_id = item.get("id")
+        name = normalize_text(item.get("name"))
+        key = normalize_text(item.get("key"))
+        item_no = item.get("itemNo")
+
+        candidates = {
+            name.lower(),
+            key.lower(),
+        }
+
+        if item_no is not None:
+            try:
+                item_no_int = int(item_no)
+                prefix = component_key.split("-")[0] if "-" in component_key else ""
+                if prefix:
+                    candidates.add(f"{prefix.lower()}-{item_no_int}")
+                    candidates.add(f"{prefix.lower()}-{item_no_int:03d}")
+            except Exception:
+                pass
+
+        if normalized_target in candidates:
+            if not item_id:
+                raise RuntimeError(f"Component found but item id missing: {component_key}")
+            return int(item_id)
+
+    raise RuntimeError(f"Component not found in tracker {component_tracker_id}: {component_key}")
+
+
+def create_codebeamer_item(data: Dict[str, Any]) -> None:
+    base_url = get_base_url()
+    auth = get_auth()
+
+    tracker_id = int(require_env("CB_TRACKER_ID"))
 
     field_repository = int(require_env("CB_FIELD_REPOSITORY"))
     field_file_path = int(require_env("CB_FIELD_FILE_PATH"))
@@ -161,9 +307,11 @@ def create_codebeamer_item(data: dict):
     field_permalink = int(require_env("CB_FIELD_PERMALINK"))
     field_linked_component = int(require_env("CB_FIELD_LINKED_COMPONENT"))
 
-    # 현재는 가장 단순 테스트 버전:
-    # Linked Component의 실제 item id는 secret으로 직접 넣음
-    component_item_id = int(require_env("CB_COMPONENT_ITEM_ID"))
+    component_tracker_id = resolve_component_tracker_id(data["component_tracker_key"])
+    debug("RESOLVED COMPONENT TRACKER ID", component_tracker_id)
+
+    component_item_id = resolve_component_item_id(component_tracker_id, data["component_key"])
+    debug("RESOLVED COMPONENT ITEM ID", component_item_id)
 
     payload = {
         "name": f'{data["scope_name"]} @ {data["file_path"]}',
@@ -228,43 +376,33 @@ def create_codebeamer_item(data: dict):
     }
 
     url = f"{base_url}/v3/trackers/{tracker_id}/items"
+    debug("CREATE ITEM URL", url)
+    debug("CREATE ITEM PAYLOAD", payload)
 
-    print("=== Codebeamer Request URL ===")
-    print(url)
-
-    print("=== Codebeamer Request Payload ===")
-    print(json.dumps(payload, indent=2, ensure_ascii=False))
-
-    resp = requests.post(url, auth=(username, password), json=payload, timeout=60)
-
-    print("=== Codebeamer Response Status ===")
-    print(resp.status_code)
-
-    print("=== Codebeamer Response Body ===")
-    print(resp.text)
-
+    resp = requests.post(url, auth=auth, json=payload, timeout=60)
+    debug("CREATE ITEM STATUS", resp.status_code)
+    debug("CREATE ITEM BODY", safe_json(resp))
     resp.raise_for_status()
 
     print("Created Codebeamer item successfully.")
 
 
-def main():
+def main() -> None:
     repo_root = Path(".").resolve()
 
-    print("=== DEBUG START ===")
-    print("Repository root:", repo_root)
-    print("GITHUB_REPOSITORY:", os.environ.get("GITHUB_REPOSITORY"))
-    print("GITHUB_SHA:", os.environ.get("GITHUB_SHA"))
-    print("CB_BASE_URL exists:", bool(os.environ.get("CB_BASE_URL")))
-    print("CB_USERNAME exists:", bool(os.environ.get("CB_USERNAME")))
-    print("CB_PASSWORD exists:", bool(os.environ.get("CB_PASSWORD")))
-    print("CB_TRACKER_ID exists:", bool(os.environ.get("CB_TRACKER_ID")))
-    print("=== DEBUG END ===")
+    debug("DEBUG START", {
+        "Repository root": str(repo_root),
+        "GITHUB_REPOSITORY": os.environ.get("GITHUB_REPOSITORY"),
+        "GITHUB_SHA": os.environ.get("GITHUB_SHA"),
+        "CB_BASE_URL exists": bool(os.environ.get("CB_BASE_URL")),
+        "CB_USERNAME exists": bool(os.environ.get("CB_USERNAME")),
+        "CB_PASSWORD exists": bool(os.environ.get("CB_PASSWORD")),
+        "CB_TRACKER_ID exists": bool(os.environ.get("CB_TRACKER_ID")),
+        "CB_COMPONENT_TRACKER_ID exists": bool(os.environ.get("CB_COMPONENT_TRACKER_ID")),
+    })
 
-    found = find_target_comment_and_function(repo_root)
-
-    print("=== FOUND TARGET ===")
-    print(json.dumps(found, indent=2, ensure_ascii=False))
+    found = find_target_comment_and_block(repo_root)
+    debug("FOUND TARGET", found)
 
     server_url = require_env("GITHUB_SERVER_URL")
     repository = require_env("GITHUB_REPOSITORY")
@@ -280,6 +418,7 @@ def main():
     )
 
     payload_data = {
+        "component_tracker_key": found["component_tracker_key"],
         "component_key": found["component_key"],
         "scope_name": found["scope_name"],
         "file_path": found["file_path"],
@@ -290,9 +429,7 @@ def main():
         "permalink": permalink,
     }
 
-    print("=== FINAL DATA ===")
-    print(json.dumps(payload_data, indent=2, ensure_ascii=False))
-
+    debug("FINAL DATA", payload_data)
     create_codebeamer_item(payload_data)
 
 
