@@ -196,6 +196,7 @@ def get_tracker_fields(tracker_id: int) -> List[Dict[str, Any]]:
     auth = get_auth()
     url = f"{base_url}/v3/trackers/{tracker_id}/fields"
     return request_json("GET", url, auth=auth)
+    debug("Component tracker response keys", list(data.keys()) if isinstance(data, dict) else type(data))
 
 
 def resolve_field_id(tracker_id: int, env_name: str) -> int:
@@ -225,37 +226,50 @@ def resolve_field_id(tracker_id: int, env_name: str) -> int:
 def resolve_component_item_id(component_tracker_id: int, component_key: str) -> int:
     """
     component_key 예: SWDD-001
-    /v3/items/query 로 해당 컴포넌트 item id 조회
+    /v3/trackers/{trackerId}/items 로 목록을 가져와서 key/name 에서 찾음
     """
     base_url = get_base_url()
     auth = get_auth()
 
-    url = f"{base_url}/v3/items/query"
+    page = 1
+    page_size = 500
 
-    payload = {
-        "page": 1,
-        "pageSize": 10,
-        "queryString": f'tracker.id = {component_tracker_id} AND key = "{component_key}"'
-    }
+    while True:
+        url = f"{base_url}/v3/trackers/{component_tracker_id}/items?page={page}&pageSize={page_size}"
+        data = request_json("GET", url, auth=auth)
 
-    data = request_json("POST", url, auth=auth, json=payload)
+        item_refs = []
+        if isinstance(data, dict):
+            # 환경별로 items 또는 itemRefs 형태가 다를 수 있어 둘 다 대응
+            item_refs = data.get("items") or data.get("itemRefs") or []
 
-    items = data.get("items", []) if isinstance(data, dict) else []
-    debug("Resolved component query items", items)
+        debug(f"Component tracker page {page} item count", len(item_refs))
 
-    if not items:
-        raise RuntimeError(
-            f"Component item not found. tracker.id={component_tracker_id}, key={component_key}. "
-            f"인스턴스에서 key 검색이 안 되면 queryString을 name 기반으로 바꿔야 합니다."
-        )
+        if not item_refs:
+            break
 
-    if len(items) > 1:
-        raise RuntimeError(
-            f"Multiple component items found for key={component_key}. "
-            f"tracker.id={component_tracker_id}"
-        )
+        for item in item_refs:
+            item_id = item.get("id")
+            item_name = item.get("name", "")
+            item_key = item.get("key", "")
 
-    return int(items[0]["id"])
+            # key가 내려오면 key 우선 비교
+            if item_key == component_key:
+                return int(item_id)
+
+            # key가 안 내려오는 환경이면 name에 SWDD-001 이 포함되는지 확인
+            if item_name == component_key or component_key in item_name:
+                return int(item_id)
+
+        total = data.get("total") if isinstance(data, dict) else None
+        if total is not None and page * page_size >= total:
+            break
+
+        page += 1
+
+    raise RuntimeError(
+        f"Component item not found in tracker {component_tracker_id}: {component_key}"
+    )
 
 
 def create_codebeamer_item(data: Dict[str, Any]) -> None:
