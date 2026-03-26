@@ -27,7 +27,7 @@ jobs:
 
       - name: Create Codebeamer item from one comment
         env:
-          CB_BASE_URL: http://cbcnbis.com:8080
+          CB_BASE_URL: http://218.237.27.234:8080
           CB_USERNAME: admin
           CB_PASSWORD: Cnbis123!
           CB_TRACKER_ID: 146182
