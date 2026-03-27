@@ -171,51 +171,35 @@ def get_auth() -> tuple[str, str]:
     return username, password
 
 
-def get_base_url() -> str:
-    return require_env("CB_BASE_URL").rstrip("/")
+def get_api_base_url() -> str:
+    return require_env("CB_BASE_URL").rstrip("/") + "/api/v3"
 
 
-def get_tracker_fields(tracker_id: int) -> List[Dict[str, Any]]:
-    base_url = get_base_url()
-    auth = get_auth()
-    url = f"{base_url}/v3/trackers/{tracker_id}/fields"
-    return request_json("GET", url, auth=auth)
-
-
-def resolve_field_id(tracker_id: int, env_name: str) -> int:
+def resolve_field_id(env_name: str) -> int:
     raw = require_env(env_name).strip()
 
-    if raw.isdigit():
-        return int(raw)
+    if not raw.isdigit():
+        raise RuntimeError(
+            f"{env_name} must be a numeric field ID in this environment. Current value: {raw}"
+        )
 
-    fields = get_tracker_fields(tracker_id)
-
-    for field in fields:
-        if field.get("name") == raw:
-            debug(f"Resolved field name '{raw}' to fieldId", field.get("id"))
-            return int(field["id"])
-
-    available = [f.get("name") for f in fields]
-    raise RuntimeError(
-        f"Field not found in tracker {tracker_id}: {raw}. "
-        f"Available field names: {available}"
-    )
+    return int(raw)
 
 
 def create_codebeamer_item(data: Dict[str, Any]) -> None:
-    base_url = get_base_url()
+    api_base_url = get_api_base_url()
     auth = get_auth()
 
     tracker_id = int(require_env("CB_TRACKER_ID"))
 
-    field_repository = resolve_field_id(tracker_id, "CB_FIELD_REPOSITORY")
-    field_file_path = resolve_field_id(tracker_id, "CB_FIELD_FILE_PATH")
-    field_start_line = resolve_field_id(tracker_id, "CB_FIELD_START_LINE")
-    field_end_line = resolve_field_id(tracker_id, "CB_FIELD_END_LINE")
-    field_scope_name = resolve_field_id(tracker_id, "CB_FIELD_SCOPE_NAME")
-    field_commit_sha = resolve_field_id(tracker_id, "CB_FIELD_COMMIT_SHA")
-    field_permalink = resolve_field_id(tracker_id, "CB_FIELD_PERMALINK")
-    field_linked_component = resolve_field_id(tracker_id, "CB_FIELD_LINKED_COMPONENT")
+    field_repository = resolve_field_id("CB_FIELD_REPOSITORY")
+    field_file_path = resolve_field_id("CB_FIELD_FILE_PATH")
+    field_start_line = resolve_field_id("CB_FIELD_START_LINE")
+    field_end_line = resolve_field_id("CB_FIELD_END_LINE")
+    field_scope_name = resolve_field_id("CB_FIELD_SCOPE_NAME")
+    field_commit_sha = resolve_field_id("CB_FIELD_COMMIT_SHA")
+    field_permalink = resolve_field_id("CB_FIELD_PERMALINK")
+    field_linked_component = resolve_field_id("CB_FIELD_LINKED_COMPONENT")
 
     payload = {
         "name": f'{data["scope_name"]} @ {data["file_path"]}',
@@ -278,7 +262,7 @@ def create_codebeamer_item(data: Dict[str, Any]) -> None:
         ],
     }
 
-    url = f"{base_url}/v3/trackers/{tracker_id}/items"
+    url = f"{api_base_url}/trackers/{tracker_id}/items"
 
     debug("Codebeamer Create URL", url)
     debug("Codebeamer Create Payload", payload)
