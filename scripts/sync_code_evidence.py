@@ -5,7 +5,6 @@ import os
 import re
 import sys
 import json
-import base64
 import pathlib
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -13,7 +12,7 @@ import requests
 
 
 # =========================================================
-# Environment Variables
+# ENV
 # =========================================================
 CB_BASE_URL = os.getenv("CB_BASE_URL", "http://218.237.27.234:8080/cb").rstrip("/")
 CB_API_BASE = f"{CB_BASE_URL}/api/v3"
@@ -22,34 +21,36 @@ CB_USERNAME = os.getenv("CB_USERNAME", "")
 CB_PASSWORD = os.getenv("CB_PASSWORD", "")
 CB_TOKEN = os.getenv("CB_TOKEN", "")
 
-CB_TRACKER_ID = int(os.getenv("CB_TRACKER_ID", "146182"))  # Code Evidence Tracker ID
+CB_TRACKER_ID = int(os.getenv("CB_TRACKER_ID", "146182"))
 CB_FIELD_LINKED_COMPONENT = int(os.getenv("CB_FIELD_LINKED_COMPONENT", "1002"))
 
-# Optional additional custom field IDs if needed
-CB_FIELD_SCOPE = os.getenv("CB_FIELD_SCOPE", "")  # ex: "1234" if you have a dedicated custom field for scope
-CB_FIELD_SOURCE_PATH = os.getenv("CB_FIELD_SOURCE_PATH", "")  # ex: "1235"
+# 필요 시 숫자 fieldId 넣어서 사용
+CB_FIELD_SCOPE = os.getenv("CB_FIELD_SCOPE", "")                 # 예: "1234"
+CB_FIELD_REPOSITORY_NAME = os.getenv("CB_FIELD_REPOSITORY_NAME", "")
+CB_FIELD_START_LINE = os.getenv("CB_FIELD_START_LINE", "")
+CB_FIELD_END_LINE = os.getenv("CB_FIELD_END_LINE", "")
+CB_FIELD_FILE_PATH = os.getenv("CB_FIELD_FILE_PATH", "")
+CB_FIELD_COMMIT_SHA = os.getenv("CB_FIELD_COMMIT_SHA", "")
 
-# GitHub Actions / repo context
-GITHUB_REPOSITORY = os.getenv("GITHUB_REPOSITORY", "")
-GITHUB_SHA = os.getenv("GITHUB_SHA", "")
-GITHUB_REF_NAME = os.getenv("GITHUB_REF_NAME", "")
-GITHUB_SERVER_URL = os.getenv("GITHUB_SERVER_URL", "https://github.com")
-
-# Source scan config
 SCAN_ROOT = os.getenv("SCAN_ROOT", ".")
 FILE_EXTENSIONS = os.getenv(
     "FILE_EXTENSIONS",
     ".c,.cc,.cpp,.cxx,.h,.hpp,.java,.kt,.py,.js,.ts,.tsx,.jsx"
 )
 
-# Behavior
-VERIFY_AFTER_UPDATE = os.getenv("VERIFY_AFTER_UPDATE", "true").lower() == "true"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 DEBUG = os.getenv("DEBUG", "true").lower() == "true"
 
 
+# GitHub Actions context
+GITHUB_REPOSITORY = os.getenv("GITHUB_REPOSITORY", "")
+GITHUB_SHA = os.getenv("GITHUB_SHA", "")
+GITHUB_REF_NAME = os.getenv("GITHUB_REF_NAME", "")
+GITHUB_SERVER_URL = os.getenv("GITHUB_SERVER_URL", "https://github.com")
+
+
 # =========================================================
-# HTTP Session
+# SESSION
 # =========================================================
 session = requests.Session()
 session.headers.update({
@@ -58,18 +59,16 @@ session.headers.update({
 })
 
 if CB_TOKEN:
-    session.headers.update({
-        "Authorization": f"Bearer {CB_TOKEN}"
-    })
+    session.headers.update({"Authorization": f"Bearer {CB_TOKEN}"})
 elif CB_USERNAME and CB_PASSWORD:
     session.auth = (CB_USERNAME, CB_PASSWORD)
 else:
-    print("ERROR: Set either CB_TOKEN or CB_USERNAME/CB_PASSWORD.", file=sys.stderr)
+    print("ERROR: Set CB_TOKEN or CB_USERNAME/CB_PASSWORD.", file=sys.stderr)
     sys.exit(1)
 
 
 # =========================================================
-# Utils
+# LOG
 # =========================================================
 def log(msg: str) -> None:
     print(msg, flush=True)
@@ -85,16 +84,21 @@ def fail(msg: str) -> None:
     sys.exit(1)
 
 
+# =========================================================
+# HTTP
+# =========================================================
 def request_json(method: str, url: str, expected: Tuple[int, ...] = (200, 201), **kwargs) -> Any:
     resp = session.request(method, url, timeout=REQUEST_TIMEOUT, **kwargs)
     debug(f"{method} {url} -> {resp.status_code}")
     if resp.text:
-        debug(f"Response: {resp.text[:4000]}")
+        debug(resp.text[:4000])
+
     if resp.status_code not in expected:
         raise requests.HTTPError(
             f"{method} {url} failed: {resp.status_code}\n{resp.text}",
             response=resp
         )
+
     if resp.text.strip():
         return resp.json()
     return None
@@ -108,8 +112,15 @@ def safe_request_json(method: str, url: str, expected: Tuple[int, ...] = (200, 2
         return False, None, str(e)
 
 
+# =========================================================
+# UTILS
+# =========================================================
 def normalize_path(p: str) -> str:
     return str(pathlib.Path(p).as_posix())
+
+
+def count_line(text: str, pos: int) -> int:
+    return text.count("\n", 0, pos) + 1
 
 
 def github_commit_url() -> str:
@@ -121,91 +132,41 @@ def github_commit_url() -> str:
 def github_file_url(file_path: str) -> str:
     if GITHUB_REPOSITORY and GITHUB_SHA:
         return f"{GITHUB_SERVER_URL}/{GITHUB_REPOSITORY}/blob/{GITHUB_SHA}/{normalize_path(file_path)}"
-    return normalize_path(file_path)
+    return ""
 
 
-def build_description(file_path: str, scope: str, component_id: int) -> str:
+def build_item_name(scope: str) -> str:
+    # Scope가 같으면 같은 아이템으로 보도록 이름 자체를 scope로 고정
+    return scope.strip()
+
+
+def build_description(entry: Dict[str, Any]) -> str:
     lines = [
-        f"Source File: {normalize_path(file_path)}",
-        f"Scope: {scope}",
-        f"Linked Component Candidate ID: {component_id}",
+        f"Scope: {entry['scope']}",
+        f"Source File: {entry['file_path']}",
+        f"Start Line: {entry['start_line']}",
+        f"End Line: {entry['end_line']}",
+        f"Linked Component Candidate ID: {entry['component_id']}",
     ]
+
     if GITHUB_REPOSITORY:
         lines.append(f"Repository: {GITHUB_REPOSITORY}")
     if GITHUB_REF_NAME:
         lines.append(f"Branch/Ref: {GITHUB_REF_NAME}")
     if GITHUB_SHA:
         lines.append(f"Commit: {GITHUB_SHA}")
+
     commit_url = github_commit_url()
     if commit_url:
         lines.append(f"Commit URL: {commit_url}")
-    file_url = github_file_url(file_path)
+
+    file_url = github_file_url(entry["file_path"])
     if file_url:
         lines.append(f"File URL: {file_url}")
+
     return "\n".join(lines)
 
 
-def build_item_name(scope: str, file_path: str) -> str:
-    base = pathlib.Path(file_path).name
-    return f"[Code Evidence] {scope} - {base}"
-
-
-# =========================================================
-# Parser
-# =========================================================
-COMMENT_PATTERN = re.compile(
-    r"/\*\s*CB_COMPONENT_ID\s*:\s*(\d+)\s*\*/.*?/\*\s*CB_SCOPE\s*:\s*([^\*]+?)\s*\*/",
-    re.DOTALL
-)
-
-SINGLE_COMMENT_COMPONENT = re.compile(r"/\*\s*CB_COMPONENT_ID\s*:\s*(\d+)\s*\*/")
-SINGLE_COMMENT_SCOPE = re.compile(r"/\*\s*CB_SCOPE\s*:\s*([^\*]+?)\s*\*/")
-
-
-def scan_source_files(root: str, extensions: List[str]) -> List[str]:
-    found: List[str] = []
-    root_path = pathlib.Path(root)
-    for p in root_path.rglob("*"):
-        if not p.is_file():
-            continue
-        if p.suffix.lower() in extensions:
-            found.append(str(p))
-    return found
-
-
-def parse_codebeamer_comments(file_path: str) -> List[Dict[str, Any]]:
-    text = pathlib.Path(file_path).read_text(encoding="utf-8", errors="ignore")
-    matches: List[Dict[str, Any]] = []
-
-    # 1) paired pattern
-    for m in COMMENT_PATTERN.finditer(text):
-        component_id = int(m.group(1).strip())
-        scope = m.group(2).strip()
-        matches.append({
-            "component_id": component_id,
-            "scope": scope,
-            "file_path": file_path
-        })
-
-    # 2) fallback if comments are not adjacent
-    if not matches:
-        components = SINGLE_COMMENT_COMPONENT.findall(text)
-        scopes = SINGLE_COMMENT_SCOPE.findall(text)
-        if components and scopes:
-            pair_count = min(len(components), len(scopes))
-            for i in range(pair_count):
-                matches.append({
-                    "component_id": int(components[i].strip()),
-                    "scope": scopes[i].strip(),
-                    "file_path": file_path
-                })
-
-    return matches
-
-
-# =========================================================
-# Codebeamer Payload Builders
-# =========================================================
 def make_ref_obj(item_id: int) -> Dict[str, Any]:
     return {
         "id": int(item_id),
@@ -213,30 +174,73 @@ def make_ref_obj(item_id: int) -> Dict[str, Any]:
     }
 
 
-def build_create_payload(file_path: str, scope: str, component_id: int) -> Dict[str, Any]:
-    """
-    기본 생성 payload
-    - name / description 으로 먼저 생성
-    - linked component는 생성 후 별도 update 시도
-    """
-    payload: Dict[str, Any] = {
-        "name": build_item_name(scope, file_path),
-        "description": build_description(file_path, scope, component_id),
-    }
+# =========================================================
+# PARSER
+# =========================================================
+PAIR_PATTERN = re.compile(
+    r"/\*\s*CB_COMPONENT_ID\s*:\s*(\d+)\s*\*/\s*/\*\s*CB_SCOPE\s*:\s*([^\*]+?)\s*\*/",
+    re.DOTALL
+)
 
+
+def scan_source_files(root: str, extensions: List[str]) -> List[str]:
+    root_path = pathlib.Path(root)
+    results: List[str] = []
+
+    for p in root_path.rglob("*"):
+        if p.is_file() and p.suffix.lower() in extensions:
+            results.append(str(p))
+
+    return results
+
+
+def parse_codebeamer_comments(file_path: str) -> List[Dict[str, Any]]:
+    text = pathlib.Path(file_path).read_text(encoding="utf-8", errors="ignore")
+    entries: List[Dict[str, Any]] = []
+
+    for m in PAIR_PATTERN.finditer(text):
+        component_id = int(m.group(1).strip())
+        scope = m.group(2).strip()
+        start_line = count_line(text, m.start())
+        end_line = count_line(text, m.end())
+
+        entries.append({
+            "component_id": component_id,
+            "scope": scope,
+            "file_path": normalize_path(file_path),
+            "start_line": start_line,
+            "end_line": end_line,
+        })
+
+    return entries
+
+
+# =========================================================
+# PAYLOAD
+# =========================================================
+def add_simple_field(field_values: List[Dict[str, Any]], field_id: str, value: Any) -> None:
+    if not field_id:
+        return
+    field_values.append({
+        "fieldId": int(field_id),
+        "values": [value]
+    })
+
+
+def build_core_payload(entry: Dict[str, Any]) -> Dict[str, Any]:
     field_values: List[Dict[str, Any]] = []
 
-    if CB_FIELD_SCOPE:
-        field_values.append({
-            "fieldId": int(CB_FIELD_SCOPE),
-            "values": [scope]
-        })
+    add_simple_field(field_values, CB_FIELD_SCOPE, entry["scope"])
+    add_simple_field(field_values, CB_FIELD_REPOSITORY_NAME, GITHUB_REPOSITORY)
+    add_simple_field(field_values, CB_FIELD_START_LINE, entry["start_line"])
+    add_simple_field(field_values, CB_FIELD_END_LINE, entry["end_line"])
+    add_simple_field(field_values, CB_FIELD_FILE_PATH, entry["file_path"])
+    add_simple_field(field_values, CB_FIELD_COMMIT_SHA, GITHUB_SHA)
 
-    if CB_FIELD_SOURCE_PATH:
-        field_values.append({
-            "fieldId": int(CB_FIELD_SOURCE_PATH),
-            "values": [normalize_path(file_path)]
-        })
+    payload: Dict[str, Any] = {
+        "name": build_item_name(entry["scope"]),
+        "description": build_description(entry),
+    }
 
     if field_values:
         payload["fieldValues"] = field_values
@@ -244,116 +248,94 @@ def build_create_payload(file_path: str, scope: str, component_id: int) -> Dict[
     return payload
 
 
-def linked_component_candidate_payloads(component_id: int) -> List[Dict[str, Any]]:
-    ref = make_ref_obj(component_id)
+def build_linked_component_candidate_payloads(component_ids: List[int]) -> List[Dict[str, Any]]:
+    refs = [make_ref_obj(x) for x in component_ids]
+    id_only_refs = [{"id": int(x)} for x in component_ids]
 
-    candidates = [
-        # Candidate 1
+    return [
         {
             "fieldValues": [
                 {
                     "fieldId": CB_FIELD_LINKED_COMPONENT,
-                    "values": [ref]
+                    "values": refs
                 }
             ]
         },
-        # Candidate 2
         {
             "customFields": [
                 {
                     "fieldId": CB_FIELD_LINKED_COMPONENT,
-                    "values": [ref]
+                    "values": refs
                 }
             ]
         },
-        # Candidate 3
         {
             "fieldValues": [
                 {
                     "fieldId": CB_FIELD_LINKED_COMPONENT,
-                    "value": [ref]
+                    "value": refs
                 }
             ]
         },
-        # Candidate 4
+        {
+            "customFields": [
+                {
+                    "fieldId": CB_FIELD_LINKED_COMPONENT,
+                    "value": refs
+                }
+            ]
+        },
         {
             "fieldValues": [
                 {
                     "id": CB_FIELD_LINKED_COMPONENT,
-                    "values": [ref]
+                    "values": refs
                 }
             ]
         },
-        # Candidate 5
         {
             "customFields": [
                 {
                     "id": CB_FIELD_LINKED_COMPONENT,
-                    "values": [ref]
+                    "values": refs
                 }
             ]
         },
-        # Candidate 6
         {
             "fieldValues": [
                 {
                     "fieldId": CB_FIELD_LINKED_COMPONENT,
-                    "value": ref
+                    "values": id_only_refs
                 }
             ]
         },
-        # Candidate 7
         {
             "customFields": [
                 {
                     "fieldId": CB_FIELD_LINKED_COMPONENT,
-                    "value": ref
-                }
-            ]
-        },
-        # Candidate 8
-        {
-            "fieldValues": [
-                {
-                    "fieldId": CB_FIELD_LINKED_COMPONENT,
-                    "values": [{"id": int(component_id)}]
-                }
-            ]
-        },
-        # Candidate 9
-        {
-            "customFields": [
-                {
-                    "fieldId": CB_FIELD_LINKED_COMPONENT,
-                    "values": [{"id": int(component_id)}]
-                }
-            ]
-        },
-        # Candidate 10
-        {
-            "fieldValues": [
-                {
-                    "fieldId": CB_FIELD_LINKED_COMPONENT,
-                    "values": [
-                        {
-                            "id": int(component_id),
-                            "name": str(component_id),
-                            "type": "TrackerItemReference"
-                        }
-                    ]
+                    "values": id_only_refs
                 }
             ]
         },
     ]
-    return candidates
 
 
 # =========================================================
-# Codebeamer API
+# API
 # =========================================================
-def create_work_item(tracker_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
-    url = f"{CB_API_BASE}/trackers/{tracker_id}/items"
+def create_work_item(payload: Dict[str, Any]) -> Dict[str, Any]:
+    url = f"{CB_API_BASE}/trackers/{CB_TRACKER_ID}/items"
     return request_json("POST", url, expected=(200, 201), data=json.dumps(payload))
+
+
+def patch_work_item(item_id: int, payload: Dict[str, Any]) -> Tuple[bool, Optional[Any], Optional[str]]:
+    url = f"{CB_API_BASE}/items/{item_id}"
+    return safe_request_json("PATCH", url, expected=(200, 201), data=json.dumps(payload))
+
+
+def put_work_item(item_id: int, payload: Dict[str, Any]) -> Tuple[bool, Optional[Any], Optional[str]]:
+    url = f"{CB_API_BASE}/items/{item_id}"
+    return safe_request_json("PUT", url, expected=(200, 201), data=json.dumps(payload))
 
 
 def get_work_item(item_id: int) -> Dict[str, Any]:
@@ -361,18 +343,38 @@ def get_work_item(item_id: int) -> Dict[str, Any]:
     return request_json("GET", url, expected=(200,), params={"include": "fieldValues,customFields"})
 
 
-def update_work_item_put(item_id: int, payload: Dict[str, Any]) -> Tuple[bool, Optional[Any], Optional[str]]:
-    url = f"{CB_API_BASE}/items/{item_id}"
-    return safe_request_json("PUT", url, expected=(200, 201), data=json.dumps(payload))
+def list_tracker_items() -> List[Dict[str, Any]]:
+    url = f"{CB_API_BASE}/trackers/{CB_TRACKER_ID}/items"
+
+    # page 방식 시도
+    ok, data, err = safe_request_json(
+        "GET",
+        url,
+        expected=(200,),
+        params={"page": 1, "pageSize": 500}
+    )
+
+    if not ok:
+        debug(f"Paged list failed, fallback simple GET: {err}")
+        data = request_json("GET", url, expected=(200,))
+
+    if isinstance(data, list):
+        return data
+
+    if isinstance(data, dict):
+        if isinstance(data.get("items"), list):
+            return data["items"]
+        if isinstance(data.get("results"), list):
+            return data["results"]
+
+    return []
 
 
-def update_work_item_patch(item_id: int, payload: Dict[str, Any]) -> Tuple[bool, Optional[Any], Optional[str]]:
-    url = f"{CB_API_BASE}/items/{item_id}"
-    return safe_request_json("PATCH", url, expected=(200, 201), data=json.dumps(payload))
-
-
-def extract_linked_component_values(item_data: Dict[str, Any]) -> List[int]:
-    result: List[int] = []
+# =========================================================
+# FIELD EXTRACTION
+# =========================================================
+def extract_field_values(item_data: Dict[str, Any], target_field_id: int) -> List[Any]:
+    result: List[Any] = []
 
     for key in ("fieldValues", "customFields"):
         arr = item_data.get(key, [])
@@ -381,7 +383,13 @@ def extract_linked_component_values(item_data: Dict[str, Any]) -> List[int]:
 
         for field in arr:
             field_id = field.get("fieldId", field.get("id"))
-            if int(field_id) != CB_FIELD_LINKED_COMPONENT:
+            if field_id is None:
+                continue
+
+            try:
+                if int(field_id) != int(target_field_id):
+                    continue
+            except Exception:
                 continue
 
             values = field.get("values")
@@ -390,146 +398,254 @@ def extract_linked_component_values(item_data: Dict[str, Any]) -> List[int]:
                 if single_value is not None:
                     values = single_value if isinstance(single_value, list) else [single_value]
 
-            if not isinstance(values, list):
-                continue
-
-            for v in values:
-                if isinstance(v, dict) and "id" in v:
-                    try:
-                        result.append(int(v["id"]))
-                    except Exception:
-                        pass
-                elif isinstance(v, int):
-                    result.append(v)
+            if isinstance(values, list):
+                result.extend(values)
 
     return result
 
 
+def extract_linked_component_ids(item_data: Dict[str, Any]) -> List[int]:
+    result: List[int] = []
+    values = extract_field_values(item_data, CB_FIELD_LINKED_COMPONENT)
+
+    for v in values:
+        if isinstance(v, dict) and "id" in v:
+            try:
+                result.append(int(v["id"]))
+            except Exception:
+                pass
+        elif isinstance(v, int):
+            result.append(v)
+
+    return sorted(set(result))
+
+
+def extract_scope_from_name(name: str) -> List[str]:
+    candidates = []
+    raw = (name or "").strip()
+    if not raw:
+        return candidates
+
+    candidates.append(raw)
+
+    prefix = "[Code Evidence]"
+    if raw.startswith(prefix):
+        rest = raw[len(prefix):].strip()
+        if rest:
+            candidates.append(rest)
+        if " - " in rest:
+            candidates.append(rest.split(" - ", 1)[0].strip())
+
+    return sorted(set([x for x in candidates if x]))
+
+
+def extract_scope_from_description(description: str) -> Optional[str]:
+    if not description:
+        return None
+    m = re.search(r"^Scope:\s*(.+)$", description, re.MULTILINE)
+    if m:
+        return m.group(1).strip()
+    return None
+
+
+# =========================================================
+# SCOPE INDEX
+# =========================================================
+def build_scope_index() -> Dict[str, int]:
+    index: Dict[str, int] = {}
+    items = list_tracker_items()
+
+    for item in items:
+        item_id = item.get("id")
+        name = item.get("name", "")
+
+        if not item_id:
+            continue
+
+        for scope_key in extract_scope_from_name(name):
+            key = scope_key.lower()
+            if key not in index:
+                index[key] = int(item_id)
+
+    # name에서 못 찾는 경우 description / custom field 기반 보완
+    for item in items:
+        item_id = item.get("id")
+        if not item_id:
+            continue
+
+        try:
+            detail = get_work_item(int(item_id))
+        except Exception as e:
+            debug(f"Failed to read item {item_id} detail while building scope index: {e}")
+            continue
+
+        # scope custom field
+        if CB_FIELD_SCOPE:
+            values = extract_field_values(detail, int(CB_FIELD_SCOPE))
+            for v in values:
+                if isinstance(v, str) and v.strip():
+                    key = v.strip().lower()
+                    if key not in index:
+                        index[key] = int(item_id)
+
+        # description
+        scope_from_desc = extract_scope_from_description(detail.get("description", ""))
+        if scope_from_desc:
+            key = scope_from_desc.lower()
+            if key not in index:
+                index[key] = int(item_id)
+
+    return index
+
+
+# =========================================================
+# UPSERT LOGIC
+# =========================================================
+def update_core_fields(item_id: int, payload: Dict[str, Any]) -> None:
+    ok, _, err = patch_work_item(item_id, payload)
+    if ok:
+        return
+
+    debug(f"PATCH core update failed for item {item_id}: {err}")
+    ok, _, err = put_work_item(item_id, payload)
+    if ok:
+        return
+
+    raise RuntimeError(f"Core update failed for item {item_id}: {err}")
+
+
 def set_linked_component(item_id: int, component_id: int) -> bool:
-    """
-    Linked Component 필드는 payload shape 차이로 무시될 수 있어서
-    여러 후보 payload를 PUT/PATCH로 순차 시도하고
-    마지막에 실제 GET으로 반영 여부 검증
-    """
-    candidates = linked_component_candidate_payloads(component_id)
+    try:
+        detail = get_work_item(item_id)
+        existing_ids = extract_linked_component_ids(detail)
+    except Exception as e:
+        debug(f"Failed to read existing linked components for item {item_id}: {e}")
+        existing_ids = []
 
-    for idx, payload in enumerate(candidates, start=1):
-        debug(f"Trying linked component payload candidate #{idx}: {json.dumps(payload, ensure_ascii=False)}")
+    merged_ids = sorted(set(existing_ids + [int(component_id)]))
+    candidates = build_linked_component_candidate_payloads(merged_ids)
 
-        ok, _, err = update_work_item_patch(item_id, payload)
+    for i, payload in enumerate(candidates, start=1):
+        debug(f"Trying Linked Component payload #{i} for item {item_id}: {json.dumps(payload, ensure_ascii=False)}")
+
+        ok, _, err = patch_work_item(item_id, payload)
         if not ok:
-            debug(f"PATCH candidate #{idx} failed: {err}")
-            ok, _, err = update_work_item_put(item_id, payload)
+            debug(f"PATCH failed #{i}: {err}")
+            ok, _, err = put_work_item(item_id, payload)
             if not ok:
-                debug(f"PUT candidate #{idx} failed: {err}")
+                debug(f"PUT failed #{i}: {err}")
                 continue
 
-        if VERIFY_AFTER_UPDATE:
-            try:
-                item_data = get_work_item(item_id)
-                linked_ids = extract_linked_component_values(item_data)
-                debug(f"Verified linked component IDs after candidate #{idx}: {linked_ids}")
-                if int(component_id) in linked_ids:
-                    return True
-            except Exception as e:
-                debug(f"Verification failed after candidate #{idx}: {e}")
-        else:
-            return True
+        try:
+            verify = get_work_item(item_id)
+            linked_ids = extract_linked_component_ids(verify)
+            if int(component_id) in linked_ids:
+                return True
+        except Exception as e:
+            debug(f"Verification failed after payload #{i}: {e}")
 
     return False
 
 
-# =========================================================
-# Main Flow
-# =========================================================
-def process_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
-    file_path = entry["file_path"]
-    scope = entry["scope"]
-    component_id = int(entry["component_id"])
+def upsert_by_scope(entry: Dict[str, Any], scope_index: Dict[str, int]) -> Dict[str, Any]:
+    scope_key = entry["scope"].strip().lower()
+    payload = build_core_payload(entry)
 
-    create_payload = build_create_payload(file_path, scope, component_id)
-    created = create_work_item(CB_TRACKER_ID, create_payload)
+    if scope_key in scope_index:
+        item_id = int(scope_index[scope_key])
+        update_core_fields(item_id, payload)
+        action = "updated"
+    else:
+        created = create_work_item(payload)
+        item_id = int(created["id"])
+        scope_index[scope_key] = item_id
+        action = "created"
 
-    item_id = created.get("id")
-    if not item_id:
-        raise RuntimeError(f"Created item response does not include 'id': {created}")
-
-    linked_ok = set_linked_component(int(item_id), component_id)
+    linked_ok = set_linked_component(item_id, int(entry["component_id"]))
 
     return {
-        "item_id": int(item_id),
-        "scope": scope,
-        "component_id": component_id,
-        "file_path": normalize_path(file_path),
+        "action": action,
+        "item_id": item_id,
+        "scope": entry["scope"],
+        "component_id": int(entry["component_id"]),
+        "file_path": entry["file_path"],
+        "start_line": entry["start_line"],
+        "end_line": entry["end_line"],
         "linked_component_set": linked_ok,
     }
 
 
+# =========================================================
+# MAIN
+# =========================================================
 def main() -> None:
-    exts = [e.strip().lower() for e in FILE_EXTENSIONS.split(",") if e.strip()]
-    if not exts:
+    extensions = [x.strip().lower() for x in FILE_EXTENSIONS.split(",") if x.strip()]
+    if not extensions:
         fail("FILE_EXTENSIONS is empty.")
 
-    files = scan_source_files(SCAN_ROOT, exts)
+    files = scan_source_files(SCAN_ROOT, extensions)
     if not files:
         log("No source files found.")
         return
 
-    parsed_entries: List[Dict[str, Any]] = []
+    entries: List[Dict[str, Any]] = []
     for file_path in files:
         try:
-            parsed_entries.extend(parse_codebeamer_comments(file_path))
+            entries.extend(parse_codebeamer_comments(file_path))
         except Exception as e:
-            debug(f"Skipping file due to parse error: {file_path} / {e}")
+            debug(f"Parse failed: {file_path} / {e}")
 
-    if not parsed_entries:
+    if not entries:
         log("No CB_COMPONENT_ID / CB_SCOPE comments found.")
         return
 
-    log(f"Found {len(parsed_entries)} code evidence entries.")
+    log(f"Found {len(entries)} code evidence entries.")
+
+    scope_index = build_scope_index()
+    debug(f"Scope index size: {len(scope_index)}")
 
     results: List[Dict[str, Any]] = []
     failed: List[Dict[str, Any]] = []
 
-    for entry in parsed_entries:
+    for entry in entries:
         try:
-            result = process_entry(entry)
+            result = upsert_by_scope(entry, scope_index)
             results.append(result)
+
             log(
-                f"SUCCESS | item_id={result['item_id']} | "
-                f"component_id={result['component_id']} | "
+                f"SUCCESS | action={result['action']} | "
+                f"item_id={result['item_id']} | "
                 f"scope={result['scope']} | "
+                f"component_id={result['component_id']} | "
                 f"linked_component_set={result['linked_component_set']} | "
-                f"file={result['file_path']}"
+                f"file={result['file_path']}:{result['start_line']}-{result['end_line']}"
             )
         except Exception as e:
-            failed_entry = {
+            failed.append({
                 "entry": entry,
                 "error": str(e)
-            }
-            failed.append(failed_entry)
+            })
             log(
-                f"FAILED | component_id={entry.get('component_id')} | "
-                f"scope={entry.get('scope')} | "
-                f"file={entry.get('file_path')} | "
+                f"FAILED | scope={entry['scope']} | "
+                f"component_id={entry['component_id']} | "
+                f"file={entry['file_path']}:{entry['start_line']}-{entry['end_line']} | "
                 f"error={e}"
             )
 
     summary = {
-        "created_count": len(results),
+        "created_or_updated_count": len(results),
         "failed_count": len(failed),
         "results": results,
-        "failed": failed,
+        "failed": failed
     }
 
     print("\n===== SUMMARY =====")
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
-    # GitHub Actions summary / output
     github_output = os.getenv("GITHUB_OUTPUT", "")
     if github_output:
         with open(github_output, "a", encoding="utf-8") as f:
-            f.write(f"created_count={len(results)}\n")
+            f.write(f"processed_count={len(results)}\n")
             f.write(f"failed_count={len(failed)}\n")
 
     if failed:
