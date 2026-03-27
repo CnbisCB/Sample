@@ -1,327 +1,539 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import os
 import re
+import sys
 import json
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+import base64
+import pathlib
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
 
-COMMENT_COMPONENT_ID_RE = re.compile(r"CB_COMPONENT_ID:\s*(\d+)")
-COMMENT_SCOPE_RE = re.compile(r"CB_SCOPE:\s*([A-Za-z0-9_./-]+)")
-SUPPORTED_SUFFIXES = {".java", ".c", ".cpp", ".cc", ".h", ".hpp"}
+# =========================================================
+# Environment Variables
+# =========================================================
+CB_BASE_URL = os.getenv("CB_BASE_URL", "http://218.237.27.234:8080/cb").rstrip("/")
+CB_API_BASE = f"{CB_BASE_URL}/api/v3"
+
+CB_USERNAME = os.getenv("CB_USERNAME", "")
+CB_PASSWORD = os.getenv("CB_PASSWORD", "")
+CB_TOKEN = os.getenv("CB_TOKEN", "")
+
+CB_TRACKER_ID = int(os.getenv("CB_TRACKER_ID", "146182"))  # Code Evidence Tracker ID
+CB_FIELD_LINKED_COMPONENT = int(os.getenv("CB_FIELD_LINKED_COMPONENT", "1002"))
+
+# Optional additional custom field IDs if needed
+CB_FIELD_SCOPE = os.getenv("CB_FIELD_SCOPE", "")  # ex: "1234" if you have a dedicated custom field for scope
+CB_FIELD_SOURCE_PATH = os.getenv("CB_FIELD_SOURCE_PATH", "")  # ex: "1235"
+
+# GitHub Actions / repo context
+GITHUB_REPOSITORY = os.getenv("GITHUB_REPOSITORY", "")
+GITHUB_SHA = os.getenv("GITHUB_SHA", "")
+GITHUB_REF_NAME = os.getenv("GITHUB_REF_NAME", "")
+GITHUB_SERVER_URL = os.getenv("GITHUB_SERVER_URL", "https://github.com")
+
+# Source scan config
+SCAN_ROOT = os.getenv("SCAN_ROOT", ".")
+FILE_EXTENSIONS = os.getenv(
+    "FILE_EXTENSIONS",
+    ".c,.cc,.cpp,.cxx,.h,.hpp,.java,.kt,.py,.js,.ts,.tsx,.jsx"
+)
+
+# Behavior
+VERIFY_AFTER_UPDATE = os.getenv("VERIFY_AFTER_UPDATE", "true").lower() == "true"
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
+DEBUG = os.getenv("DEBUG", "true").lower() == "true"
 
 
-def require_env(name: str) -> str:
-    value = os.environ.get(name)
-    if value is None or value == "":
-        raise RuntimeError(f"Required environment variable is missing: {name}")
-    return value
+# =========================================================
+# HTTP Session
+# =========================================================
+session = requests.Session()
+session.headers.update({
+    "Accept": "application/json",
+    "Content-Type": "application/json",
+})
+
+if CB_TOKEN:
+    session.headers.update({
+        "Authorization": f"Bearer {CB_TOKEN}"
+    })
+elif CB_USERNAME and CB_PASSWORD:
+    session.auth = (CB_USERNAME, CB_PASSWORD)
+else:
+    print("ERROR: Set either CB_TOKEN or CB_USERNAME/CB_PASSWORD.", file=sys.stderr)
+    sys.exit(1)
 
 
-def debug(title: str, data: Any) -> None:
-    print(f"=== {title} ===")
-    if isinstance(data, (dict, list)):
-        print(json.dumps(data, indent=2, ensure_ascii=False))
-    else:
-        print(data)
+# =========================================================
+# Utils
+# =========================================================
+def log(msg: str) -> None:
+    print(msg, flush=True)
 
 
-def request_json(method: str, url: str, auth: tuple[str, str], **kwargs) -> Any:
-    resp = requests.request(method, url, auth=auth, timeout=60, **kwargs)
+def debug(msg: str) -> None:
+    if DEBUG:
+        print(f"[DEBUG] {msg}", flush=True)
 
-    print(f"=== {method} {url} - STATUS ===")
-    print(resp.status_code)
-    print(f"=== {method} {url} - BODY ===")
-    print(resp.text)
 
-    resp.raise_for_status()
+def fail(msg: str) -> None:
+    print(f"ERROR: {msg}", file=sys.stderr, flush=True)
+    sys.exit(1)
 
+
+def request_json(method: str, url: str, expected: Tuple[int, ...] = (200, 201), **kwargs) -> Any:
+    resp = session.request(method, url, timeout=REQUEST_TIMEOUT, **kwargs)
+    debug(f"{method} {url} -> {resp.status_code}")
+    if resp.text:
+        debug(f"Response: {resp.text[:4000]}")
+    if resp.status_code not in expected:
+        raise requests.HTTPError(
+            f"{method} {url} failed: {resp.status_code}\n{resp.text}",
+            response=resp
+        )
     if resp.text.strip():
         return resp.json()
     return None
 
 
-def is_comment_line(line: str) -> bool:
-    stripped = line.strip()
-    return (
-        stripped.startswith("//")
-        or stripped.startswith("/*")
-        or stripped.startswith("*")
-        or stripped.startswith("*/")
-    )
+def safe_request_json(method: str, url: str, expected: Tuple[int, ...] = (200, 201), **kwargs) -> Tuple[bool, Optional[Any], Optional[str]]:
+    try:
+        data = request_json(method, url, expected=expected, **kwargs)
+        return True, data, None
+    except Exception as e:
+        return False, None, str(e)
 
 
-def find_annotation_block(lines: List[str]) -> Optional[Dict[str, Any]]:
-    for i in range(len(lines)):
-        component_item_id = None
-        scope_value = None
-        last_annotation_idx = None
-
-        for j in range(i, min(i + 6, len(lines))):
-            component_match = COMMENT_COMPONENT_ID_RE.search(lines[j])
-            scope_match = COMMENT_SCOPE_RE.search(lines[j])
-
-            if component_match:
-                component_item_id = int(component_match.group(1).strip())
-                last_annotation_idx = j
-
-            if scope_match:
-                scope_value = scope_match.group(1).strip()
-                last_annotation_idx = j
-
-            if component_item_id and scope_value:
-                return {
-                    "component_item_id": component_item_id,
-                    "scope_name": scope_value,
-                    "annotation_end_index": last_annotation_idx,
-                }
-
-    return None
+def normalize_path(p: str) -> str:
+    return str(pathlib.Path(p).as_posix())
 
 
-def find_block_after_annotation(lines: List[str], annotation_end_index: int) -> Optional[Dict[str, int]]:
-    start_idx = None
-    first_open_brace_seen = False
-    brace_balance = 0
+def github_commit_url() -> str:
+    if GITHUB_REPOSITORY and GITHUB_SHA:
+        return f"{GITHUB_SERVER_URL}/{GITHUB_REPOSITORY}/commit/{GITHUB_SHA}"
+    return ""
 
-    for j in range(annotation_end_index + 1, len(lines)):
-        line = lines[j]
-        stripped = line.strip()
 
-        if not stripped:
+def github_file_url(file_path: str) -> str:
+    if GITHUB_REPOSITORY and GITHUB_SHA:
+        return f"{GITHUB_SERVER_URL}/{GITHUB_REPOSITORY}/blob/{GITHUB_SHA}/{normalize_path(file_path)}"
+    return normalize_path(file_path)
+
+
+def build_description(file_path: str, scope: str, component_id: int) -> str:
+    lines = [
+        f"Source File: {normalize_path(file_path)}",
+        f"Scope: {scope}",
+        f"Linked Component Candidate ID: {component_id}",
+    ]
+    if GITHUB_REPOSITORY:
+        lines.append(f"Repository: {GITHUB_REPOSITORY}")
+    if GITHUB_REF_NAME:
+        lines.append(f"Branch/Ref: {GITHUB_REF_NAME}")
+    if GITHUB_SHA:
+        lines.append(f"Commit: {GITHUB_SHA}")
+    commit_url = github_commit_url()
+    if commit_url:
+        lines.append(f"Commit URL: {commit_url}")
+    file_url = github_file_url(file_path)
+    if file_url:
+        lines.append(f"File URL: {file_url}")
+    return "\n".join(lines)
+
+
+def build_item_name(scope: str, file_path: str) -> str:
+    base = pathlib.Path(file_path).name
+    return f"[Code Evidence] {scope} - {base}"
+
+
+# =========================================================
+# Parser
+# =========================================================
+COMMENT_PATTERN = re.compile(
+    r"/\*\s*CB_COMPONENT_ID\s*:\s*(\d+)\s*\*/.*?/\*\s*CB_SCOPE\s*:\s*([^\*]+?)\s*\*/",
+    re.DOTALL
+)
+
+SINGLE_COMMENT_COMPONENT = re.compile(r"/\*\s*CB_COMPONENT_ID\s*:\s*(\d+)\s*\*/")
+SINGLE_COMMENT_SCOPE = re.compile(r"/\*\s*CB_SCOPE\s*:\s*([^\*]+?)\s*\*/")
+
+
+def scan_source_files(root: str, extensions: List[str]) -> List[str]:
+    found: List[str] = []
+    root_path = pathlib.Path(root)
+    for p in root_path.rglob("*"):
+        if not p.is_file():
             continue
-
-        if is_comment_line(stripped):
-            continue
-
-        start_idx = j
-        break
-
-    if start_idx is None:
-        return None
-
-    for k in range(start_idx, len(lines)):
-        line = lines[k]
-        open_count = line.count("{")
-        close_count = line.count("}")
-
-        if open_count > 0:
-            first_open_brace_seen = True
-
-        if first_open_brace_seen:
-            brace_balance += open_count
-            brace_balance -= close_count
-
-            if brace_balance == 0:
-                return {
-                    "start_line": start_idx + 1,
-                    "end_line": k + 1,
-                }
-
-    return None
+        if p.suffix.lower() in extensions:
+            found.append(str(p))
+    return found
 
 
-def find_target_comment_and_block(repo_root: Path) -> Dict[str, Any]:
-    for file_path in repo_root.rglob("*"):
-        if not file_path.is_file():
-            continue
+def parse_codebeamer_comments(file_path: str) -> List[Dict[str, Any]]:
+    text = pathlib.Path(file_path).read_text(encoding="utf-8", errors="ignore")
+    matches: List[Dict[str, Any]] = []
 
-        if file_path.suffix.lower() not in SUPPORTED_SUFFIXES:
-            continue
+    # 1) paired pattern
+    for m in COMMENT_PATTERN.finditer(text):
+        component_id = int(m.group(1).strip())
+        scope = m.group(2).strip()
+        matches.append({
+            "component_id": component_id,
+            "scope": scope,
+            "file_path": file_path
+        })
 
-        text = file_path.read_text(encoding="utf-8", errors="ignore")
-        lines = text.splitlines()
+    # 2) fallback if comments are not adjacent
+    if not matches:
+        components = SINGLE_COMMENT_COMPONENT.findall(text)
+        scopes = SINGLE_COMMENT_SCOPE.findall(text)
+        if components and scopes:
+            pair_count = min(len(components), len(scopes))
+            for i in range(pair_count):
+                matches.append({
+                    "component_id": int(components[i].strip()),
+                    "scope": scopes[i].strip(),
+                    "file_path": file_path
+                })
 
-        annotation = find_annotation_block(lines)
-        if not annotation:
-            continue
-
-        block = find_block_after_annotation(lines, annotation["annotation_end_index"])
-        if not block:
-            continue
-
-        relative_path = file_path.relative_to(repo_root).as_posix()
-
-        return {
-            "component_item_id": annotation["component_item_id"],
-            "scope_name": annotation["scope_name"],
-            "file_path": relative_path,
-            "start_line": block["start_line"],
-            "end_line": block["end_line"],
-        }
-
-    raise RuntimeError("CB_COMPONENT_ID / CB_SCOPE 주석 쌍을 찾지 못했습니다.")
+    return matches
 
 
-def build_permalink(
-    server_url: str,
-    repository: str,
-    sha: str,
-    file_path: str,
-    start_line: int,
-    end_line: int,
-) -> str:
-    return f"{server_url}/{repository}/blob/{sha}/{file_path}#L{start_line}-L{end_line}"
-
-
-def get_auth() -> tuple[str, str]:
-    username = require_env("CB_USERNAME")
-    password = require_env("CB_PASSWORD")
-    return username, password
-
-
-def get_api_base_url() -> str:
-    return require_env("CB_BASE_URL").rstrip("/") + "/api/v3"
-
-
-def resolve_field_id(env_name: str) -> int:
-    raw = require_env(env_name).strip()
-
-    if not raw.isdigit():
-        raise RuntimeError(
-            f"{env_name} must be a numeric field ID in this environment. Current value: {raw}"
-        )
-
-    return int(raw)
-
-
-def create_codebeamer_item(data: Dict[str, Any]) -> None:
-    api_base_url = get_api_base_url()
-    auth = get_auth()
-
-    tracker_id = int(require_env("CB_TRACKER_ID"))
-
-    field_repository = resolve_field_id("CB_FIELD_REPOSITORY")
-    field_file_path = resolve_field_id("CB_FIELD_FILE_PATH")
-    field_start_line = resolve_field_id("CB_FIELD_START_LINE")
-    field_end_line = resolve_field_id("CB_FIELD_END_LINE")
-    field_scope_name = resolve_field_id("CB_FIELD_SCOPE_NAME")
-    field_commit_sha = resolve_field_id("CB_FIELD_COMMIT_SHA")
-    field_permalink = resolve_field_id("CB_FIELD_PERMALINK")
-    field_linked_component = resolve_field_id("CB_FIELD_LINKED_COMPONENT")
-
-    payload = {
-        "name": f'{data["scope_name"]} @ {data["file_path"]}',
-        "description": "Generated by GitHub Actions",
-        "descriptionFormat": "PlainText",
-        "customFields": [
-            {
-                "fieldId": field_repository,
-                "name": "Repository Name",
-                "type": "TextFieldValue",
-                "value": data["repository"],
-            },
-            {
-                "fieldId": field_file_path,
-                "name": "File Path",
-                "type": "TextFieldValue",
-                "value": data["file_path"],
-            },
-            {
-                "fieldId": field_start_line,
-                "name": "Start Line",
-                "type": "IntegerFieldValue",
-                "value": data["start_line"],
-            },
-            {
-                "fieldId": field_end_line,
-                "name": "End Line",
-                "type": "IntegerFieldValue",
-                "value": data["end_line"],
-            },
-            {
-                "fieldId": field_scope_name,
-                "name": "Scope Name",
-                "type": "TextFieldValue",
-                "value": data["scope_name"],
-            },
-            {
-                "fieldId": field_commit_sha,
-                "name": "Commit SHA",
-                "type": "TextFieldValue",
-                "value": data["commit_sha"],
-            },
-            {
-                "fieldId": field_permalink,
-                "name": "GitHub Permalink",
-                "type": "TextFieldValue",
-                "value": data["permalink"],
-            },
-            {
-                "fieldId": field_linked_component,
-                "name": "Linked Component",
-                "type": "ChoiceFieldValue",
-                "values": [
-                    {
-                        "id": data["component_item_id"],
-                        "type": "TrackerItemReference",
-                    }
-                ],
-            },
-        ],
+# =========================================================
+# Codebeamer Payload Builders
+# =========================================================
+def make_ref_obj(item_id: int) -> Dict[str, Any]:
+    return {
+        "id": int(item_id),
+        "type": "TrackerItemReference"
     }
 
-    url = f"{api_base_url}/trackers/{tracker_id}/items"
 
-    debug("Codebeamer Create URL", url)
-    debug("Codebeamer Create Payload", payload)
+def build_create_payload(file_path: str, scope: str, component_id: int) -> Dict[str, Any]:
+    """
+    기본 생성 payload
+    - name / description 으로 먼저 생성
+    - linked component는 생성 후 별도 update 시도
+    """
+    payload: Dict[str, Any] = {
+        "name": build_item_name(scope, file_path),
+        "description": build_description(file_path, scope, component_id),
+    }
 
-    resp = requests.post(url, auth=auth, json=payload, timeout=60)
+    field_values: List[Dict[str, Any]] = []
 
-    print("=== POST CREATE ITEM STATUS ===")
-    print(resp.status_code)
-    print("=== POST CREATE ITEM BODY ===")
-    print(resp.text)
+    if CB_FIELD_SCOPE:
+        field_values.append({
+            "fieldId": int(CB_FIELD_SCOPE),
+            "values": [scope]
+        })
 
-    resp.raise_for_status()
+    if CB_FIELD_SOURCE_PATH:
+        field_values.append({
+            "fieldId": int(CB_FIELD_SOURCE_PATH),
+            "values": [normalize_path(file_path)]
+        })
 
-    print("Created Codebeamer item successfully.")
+    if field_values:
+        payload["fieldValues"] = field_values
+
+    return payload
+
+
+def linked_component_candidate_payloads(component_id: int) -> List[Dict[str, Any]]:
+    ref = make_ref_obj(component_id)
+
+    candidates = [
+        # Candidate 1
+        {
+            "fieldValues": [
+                {
+                    "fieldId": CB_FIELD_LINKED_COMPONENT,
+                    "values": [ref]
+                }
+            ]
+        },
+        # Candidate 2
+        {
+            "customFields": [
+                {
+                    "fieldId": CB_FIELD_LINKED_COMPONENT,
+                    "values": [ref]
+                }
+            ]
+        },
+        # Candidate 3
+        {
+            "fieldValues": [
+                {
+                    "fieldId": CB_FIELD_LINKED_COMPONENT,
+                    "value": [ref]
+                }
+            ]
+        },
+        # Candidate 4
+        {
+            "fieldValues": [
+                {
+                    "id": CB_FIELD_LINKED_COMPONENT,
+                    "values": [ref]
+                }
+            ]
+        },
+        # Candidate 5
+        {
+            "customFields": [
+                {
+                    "id": CB_FIELD_LINKED_COMPONENT,
+                    "values": [ref]
+                }
+            ]
+        },
+        # Candidate 6
+        {
+            "fieldValues": [
+                {
+                    "fieldId": CB_FIELD_LINKED_COMPONENT,
+                    "value": ref
+                }
+            ]
+        },
+        # Candidate 7
+        {
+            "customFields": [
+                {
+                    "fieldId": CB_FIELD_LINKED_COMPONENT,
+                    "value": ref
+                }
+            ]
+        },
+        # Candidate 8
+        {
+            "fieldValues": [
+                {
+                    "fieldId": CB_FIELD_LINKED_COMPONENT,
+                    "values": [{"id": int(component_id)}]
+                }
+            ]
+        },
+        # Candidate 9
+        {
+            "customFields": [
+                {
+                    "fieldId": CB_FIELD_LINKED_COMPONENT,
+                    "values": [{"id": int(component_id)}]
+                }
+            ]
+        },
+        # Candidate 10
+        {
+            "fieldValues": [
+                {
+                    "fieldId": CB_FIELD_LINKED_COMPONENT,
+                    "values": [
+                        {
+                            "id": int(component_id),
+                            "name": str(component_id),
+                            "type": "TrackerItemReference"
+                        }
+                    ]
+                }
+            ]
+        },
+    ]
+    return candidates
+
+
+# =========================================================
+# Codebeamer API
+# =========================================================
+def create_work_item(tracker_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
+    url = f"{CB_API_BASE}/trackers/{tracker_id}/items"
+    return request_json("POST", url, expected=(200, 201), data=json.dumps(payload))
+
+
+def get_work_item(item_id: int) -> Dict[str, Any]:
+    url = f"{CB_API_BASE}/items/{item_id}"
+    return request_json("GET", url, expected=(200,), params={"include": "fieldValues,customFields"})
+
+
+def update_work_item_put(item_id: int, payload: Dict[str, Any]) -> Tuple[bool, Optional[Any], Optional[str]]:
+    url = f"{CB_API_BASE}/items/{item_id}"
+    return safe_request_json("PUT", url, expected=(200, 201), data=json.dumps(payload))
+
+
+def update_work_item_patch(item_id: int, payload: Dict[str, Any]) -> Tuple[bool, Optional[Any], Optional[str]]:
+    url = f"{CB_API_BASE}/items/{item_id}"
+    return safe_request_json("PATCH", url, expected=(200, 201), data=json.dumps(payload))
+
+
+def extract_linked_component_values(item_data: Dict[str, Any]) -> List[int]:
+    result: List[int] = []
+
+    for key in ("fieldValues", "customFields"):
+        arr = item_data.get(key, [])
+        if not isinstance(arr, list):
+            continue
+
+        for field in arr:
+            field_id = field.get("fieldId", field.get("id"))
+            if int(field_id) != CB_FIELD_LINKED_COMPONENT:
+                continue
+
+            values = field.get("values")
+            if values is None:
+                single_value = field.get("value")
+                if single_value is not None:
+                    values = single_value if isinstance(single_value, list) else [single_value]
+
+            if not isinstance(values, list):
+                continue
+
+            for v in values:
+                if isinstance(v, dict) and "id" in v:
+                    try:
+                        result.append(int(v["id"]))
+                    except Exception:
+                        pass
+                elif isinstance(v, int):
+                    result.append(v)
+
+    return result
+
+
+def set_linked_component(item_id: int, component_id: int) -> bool:
+    """
+    Linked Component 필드는 payload shape 차이로 무시될 수 있어서
+    여러 후보 payload를 PUT/PATCH로 순차 시도하고
+    마지막에 실제 GET으로 반영 여부 검증
+    """
+    candidates = linked_component_candidate_payloads(component_id)
+
+    for idx, payload in enumerate(candidates, start=1):
+        debug(f"Trying linked component payload candidate #{idx}: {json.dumps(payload, ensure_ascii=False)}")
+
+        ok, _, err = update_work_item_patch(item_id, payload)
+        if not ok:
+            debug(f"PATCH candidate #{idx} failed: {err}")
+            ok, _, err = update_work_item_put(item_id, payload)
+            if not ok:
+                debug(f"PUT candidate #{idx} failed: {err}")
+                continue
+
+        if VERIFY_AFTER_UPDATE:
+            try:
+                item_data = get_work_item(item_id)
+                linked_ids = extract_linked_component_values(item_data)
+                debug(f"Verified linked component IDs after candidate #{idx}: {linked_ids}")
+                if int(component_id) in linked_ids:
+                    return True
+            except Exception as e:
+                debug(f"Verification failed after candidate #{idx}: {e}")
+        else:
+            return True
+
+    return False
+
+
+# =========================================================
+# Main Flow
+# =========================================================
+def process_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
+    file_path = entry["file_path"]
+    scope = entry["scope"]
+    component_id = int(entry["component_id"])
+
+    create_payload = build_create_payload(file_path, scope, component_id)
+    created = create_work_item(CB_TRACKER_ID, create_payload)
+
+    item_id = created.get("id")
+    if not item_id:
+        raise RuntimeError(f"Created item response does not include 'id': {created}")
+
+    linked_ok = set_linked_component(int(item_id), component_id)
+
+    return {
+        "item_id": int(item_id),
+        "scope": scope,
+        "component_id": component_id,
+        "file_path": normalize_path(file_path),
+        "linked_component_set": linked_ok,
+    }
 
 
 def main() -> None:
-    repo_root = Path(".").resolve()
+    exts = [e.strip().lower() for e in FILE_EXTENSIONS.split(",") if e.strip()]
+    if not exts:
+        fail("FILE_EXTENSIONS is empty.")
 
-    debug("DEBUG START", {
-        "Repository root": str(repo_root),
-        "GITHUB_REPOSITORY": os.environ.get("GITHUB_REPOSITORY"),
-        "GITHUB_SHA": os.environ.get("GITHUB_SHA"),
-        "CB_BASE_URL exists": bool(os.environ.get("CB_BASE_URL")),
-        "CB_USERNAME exists": bool(os.environ.get("CB_USERNAME")),
-        "CB_PASSWORD exists": bool(os.environ.get("CB_PASSWORD")),
-        "CB_TRACKER_ID exists": bool(os.environ.get("CB_TRACKER_ID")),
-    })
+    files = scan_source_files(SCAN_ROOT, exts)
+    if not files:
+        log("No source files found.")
+        return
 
-    found = find_target_comment_and_block(repo_root)
-    debug("FOUND TARGET", found)
+    parsed_entries: List[Dict[str, Any]] = []
+    for file_path in files:
+        try:
+            parsed_entries.extend(parse_codebeamer_comments(file_path))
+        except Exception as e:
+            debug(f"Skipping file due to parse error: {file_path} / {e}")
 
-    server_url = require_env("GITHUB_SERVER_URL")
-    repository = require_env("GITHUB_REPOSITORY")
-    sha = require_env("GITHUB_SHA")
+    if not parsed_entries:
+        log("No CB_COMPONENT_ID / CB_SCOPE comments found.")
+        return
 
-    permalink = build_permalink(
-        server_url=server_url,
-        repository=repository,
-        sha=sha,
-        file_path=found["file_path"],
-        start_line=found["start_line"],
-        end_line=found["end_line"],
-    )
+    log(f"Found {len(parsed_entries)} code evidence entries.")
 
-    payload_data = {
-        "component_item_id": found["component_item_id"],
-        "scope_name": found["scope_name"],
-        "file_path": found["file_path"],
-        "start_line": found["start_line"],
-        "end_line": found["end_line"],
-        "repository": repository,
-        "commit_sha": sha,
-        "permalink": permalink,
+    results: List[Dict[str, Any]] = []
+    failed: List[Dict[str, Any]] = []
+
+    for entry in parsed_entries:
+        try:
+            result = process_entry(entry)
+            results.append(result)
+            log(
+                f"SUCCESS | item_id={result['item_id']} | "
+                f"component_id={result['component_id']} | "
+                f"scope={result['scope']} | "
+                f"linked_component_set={result['linked_component_set']} | "
+                f"file={result['file_path']}"
+            )
+        except Exception as e:
+            failed_entry = {
+                "entry": entry,
+                "error": str(e)
+            }
+            failed.append(failed_entry)
+            log(
+                f"FAILED | component_id={entry.get('component_id')} | "
+                f"scope={entry.get('scope')} | "
+                f"file={entry.get('file_path')} | "
+                f"error={e}"
+            )
+
+    summary = {
+        "created_count": len(results),
+        "failed_count": len(failed),
+        "results": results,
+        "failed": failed,
     }
 
-    debug("FINAL DATA", payload_data)
+    print("\n===== SUMMARY =====")
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
 
-    create_codebeamer_item(payload_data)
+    # GitHub Actions summary / output
+    github_output = os.getenv("GITHUB_OUTPUT", "")
+    if github_output:
+        with open(github_output, "a", encoding="utf-8") as f:
+            f.write(f"created_count={len(results)}\n")
+            f.write(f"failed_count={len(failed)}\n")
+
+    if failed:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
