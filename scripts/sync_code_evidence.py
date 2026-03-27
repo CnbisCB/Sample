@@ -27,7 +27,7 @@ def debug(title: str, data: Any) -> None:
         print(data)
 
 
-def request_json(method: str, url: str, auth: tuple[str, str], **kwargs) -> Any:
+def request(method: str, url: str, auth: tuple[str, str], **kwargs) -> requests.Response:
     resp = requests.request(method, url, auth=auth, timeout=60, **kwargs)
 
     print(f"=== {method} {url} - STATUS ===")
@@ -36,7 +36,11 @@ def request_json(method: str, url: str, auth: tuple[str, str], **kwargs) -> Any:
     print(resp.text)
 
     resp.raise_for_status()
+    return resp
 
+
+def request_json(method: str, url: str, auth: tuple[str, str], **kwargs) -> Any:
+    resp = request(method, url, auth, **kwargs)
     if resp.text.strip():
         try:
             return resp.json()
@@ -89,8 +93,7 @@ def find_block_after_annotation(lines: List[str], annotation_end_index: int) -> 
     brace_balance = 0
 
     for j in range(annotation_end_index + 1, len(lines)):
-        line = lines[j]
-        stripped = line.strip()
+        stripped = lines[j].strip()
 
         if not stripped:
             continue
@@ -180,12 +183,10 @@ def get_api_base_url() -> str:
 
 def resolve_field_id(env_name: str) -> int:
     raw = require_env(env_name).strip()
-
     if not raw.isdigit():
         raise RuntimeError(
             f"{env_name} must be a numeric field ID in this environment. Current value: {raw}"
         )
-
     return int(raw)
 
 
@@ -200,7 +201,7 @@ def has_linked_component(item_data: Any, field_id: int, component_item_id: int) 
 
     custom_fields = item_data.get("customFields", [])
     for field in custom_fields:
-        if field.get("fieldId") != field_id:
+        if int(field.get("fieldId", -1)) != field_id:
             continue
 
         values = field.get("values", [])
@@ -240,15 +241,7 @@ def update_linked_component(
     debug("Codebeamer Update URL", url)
     debug("Codebeamer Update Payload", payload)
 
-    resp = requests.put(url, auth=auth, json=payload, timeout=60)
-
-    print("=== PUT UPDATE ITEM STATUS ===")
-    print(resp.status_code)
-    print("=== PUT UPDATE ITEM BODY ===")
-    print(resp.text)
-
-    resp.raise_for_status()
-
+    resp = request("PUT", url, auth=auth, json=payload)
     if resp.text.strip():
         try:
             return resp.json()
@@ -339,15 +332,7 @@ def create_codebeamer_item(data: Dict[str, Any]) -> None:
     debug("Codebeamer Create URL", url)
     debug("Codebeamer Create Payload", payload)
 
-    resp = requests.post(url, auth=auth, json=payload, timeout=60)
-
-    print("=== POST CREATE ITEM STATUS ===")
-    print(resp.status_code)
-    print("=== POST CREATE ITEM BODY ===")
-    print(resp.text)
-
-    resp.raise_for_status()
-
+    resp = request("POST", url, auth=auth, json=payload)
     created = resp.json()
     debug("CREATED ITEM RESPONSE", created)
 
@@ -379,4 +364,45 @@ def main() -> None:
 
     debug("DEBUG START", {
         "Repository root": str(repo_root),
-        "GITHUB_RE
+        "GITHUB_REPOSITORY": os.environ.get("GITHUB_REPOSITORY"),
+        "GITHUB_SHA": os.environ.get("GITHUB_SHA"),
+        "CB_BASE_URL exists": bool(os.environ.get("CB_BASE_URL")),
+        "CB_USERNAME exists": bool(os.environ.get("CB_USERNAME")),
+        "CB_PASSWORD exists": bool(os.environ.get("CB_PASSWORD")),
+        "CB_TRACKER_ID exists": bool(os.environ.get("CB_TRACKER_ID")),
+    })
+
+    found = find_target_comment_and_block(repo_root)
+    debug("FOUND TARGET", found)
+
+    server_url = require_env("GITHUB_SERVER_URL")
+    repository = require_env("GITHUB_REPOSITORY")
+    sha = require_env("GITHUB_SHA")
+
+    permalink = build_permalink(
+        server_url=server_url,
+        repository=repository,
+        sha=sha,
+        file_path=found["file_path"],
+        start_line=found["start_line"],
+        end_line=found["end_line"],
+    )
+
+    payload_data = {
+        "component_item_id": found["component_item_id"],
+        "scope_name": found["scope_name"],
+        "file_path": found["file_path"],
+        "start_line": found["start_line"],
+        "end_line": found["end_line"],
+        "repository": repository,
+        "commit_sha": sha,
+        "permalink": permalink,
+    }
+
+    debug("FINAL DATA", payload_data)
+
+    create_codebeamer_item(payload_data)
+
+
+if __name__ == "__main__":
+    main()
