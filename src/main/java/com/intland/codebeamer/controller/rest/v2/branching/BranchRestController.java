@@ -173,7 +173,6 @@ public class BranchRestController extends AbstractUserAwareRestController {
 		private final BranchDto branch;
 		private final UserDto user;
 /* CB_COMPONENT_ID: SwDD-001 */
-/* CB_SCOPE: Diag_Process */
 		public BranchCreationContext(CreateBranchModel branchModel, UserDto user) throws ResourceNotFoundException, BadRequestException, ResourceForbiddenException {
 			this.branchModel = branchModel;
 			this.user = user;
@@ -185,7 +184,6 @@ public class BranchRestController extends AbstractUserAwareRestController {
 			branch = createBranchDto();
 		}
 /* CB_COMPONENT_ID: SwDD-001,SwDD-002,SwDD-003 */
-/* CB_SCOPE: Diag_Process */
 		public CreateBranchParameterDto createCreateBranchParameterDto(Set<Integer> involvedTrackerIds, Map<TrackerDto,BranchCreationContext> branches) {
 			return createCreateBranchParameterDto(
 					createCreateBranchParameters(
