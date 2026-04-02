@@ -365,8 +365,7 @@ def build_url_field_value(
     if value_model != "UrlFieldValue":
         raise RuntimeError(
             f"Field {field_info.get('id')} ({field_info.get('name')}) in tracker {tracker_id} "
-            f"is not a Url field. Current valueModel={value_model}. "
-            "Please configure the Permalink field as Url/Hyperlink field in Codebeamer."
+            f"is not a Url field. Current valueModel={value_model}."
         )
 
     return {
@@ -374,6 +373,26 @@ def build_url_field_value(
         "name": field_info["name"],
         "type": "UrlFieldValue",
         "value": url_value,
+    }
+
+
+def build_wikitext_field_value(
+    tracker_id: int,
+    field_info: Dict[str, Any],
+    text_value: str,
+) -> Dict[str, Any]:
+    value_model = field_info.get("valueModel")
+    if value_model != "WikiTextFieldValue":
+        raise RuntimeError(
+            f"Field {field_info.get('id')} ({field_info.get('name')}) in tracker {tracker_id} "
+            f"is not a Wikitext field. Current valueModel={value_model}."
+        )
+
+    return {
+        "fieldId": int(field_info["id"]),
+        "name": field_info["name"],
+        "type": "WikiTextFieldValue",
+        "value": text_value,
     }
 
 
@@ -431,9 +450,11 @@ def build_custom_fields_for_create(
     field_end_line = resolve_field_id("CB_FIELD_END_LINE")
     field_commit_sha = resolve_field_id("CB_FIELD_COMMIT_SHA")
     field_permalink = resolve_field_id("CB_FIELD_PERMALINK")
+    field_permalink_label = resolve_field_id("CB_FIELD_PERMALINK_LABEL")
     field_linked_component = resolve_field_id("CB_FIELD_LINKED_COMPONENT")
 
     permalink_field_info = get_field_info(auth, api_base_url, tracker_id, field_permalink)
+    permalink_label_field_info = get_field_info(auth, api_base_url, tracker_id, field_permalink_label)
     linked_component_field_info = get_field_info(auth, api_base_url, tracker_id, field_linked_component)
 
     return [
@@ -443,6 +464,11 @@ def build_custom_fields_for_create(
         build_integer_field_value(field_end_line, "End Line", data["end_line"]),
         build_text_field_value(field_commit_sha, "Commit SHA", data["commit_sha"]),
         build_url_field_value(tracker_id, permalink_field_info, data["permalink"]),
+        build_wikitext_field_value(
+            tracker_id,
+            permalink_label_field_info,
+            f"[GITHUB LINK|{data['permalink']}]",
+        ),
         build_linked_component_field_value(
             tracker_id,
             linked_component_field_info,
@@ -463,9 +489,11 @@ def build_field_values_for_update(
     field_end_line = resolve_field_id("CB_FIELD_END_LINE")
     field_commit_sha = resolve_field_id("CB_FIELD_COMMIT_SHA")
     field_permalink = resolve_field_id("CB_FIELD_PERMALINK")
+    field_permalink_label = resolve_field_id("CB_FIELD_PERMALINK_LABEL")
     field_linked_component = resolve_field_id("CB_FIELD_LINKED_COMPONENT")
 
     permalink_field_info = get_field_info(auth, api_base_url, tracker_id, field_permalink)
+    permalink_label_field_info = get_field_info(auth, api_base_url, tracker_id, field_permalink_label)
     linked_component_field_info = get_field_info(auth, api_base_url, tracker_id, field_linked_component)
 
     return [
@@ -475,6 +503,11 @@ def build_field_values_for_update(
         build_integer_field_value(field_end_line, "End Line", data["end_line"]),
         build_text_field_value(field_commit_sha, "Commit SHA", data["commit_sha"]),
         build_url_field_value(tracker_id, permalink_field_info, data["permalink"]),
+        build_wikitext_field_value(
+            tracker_id,
+            permalink_label_field_info,
+            f"[GITHUB LINK|{data['permalink']}]",
+        ),
         build_linked_component_field_value(
             tracker_id,
             linked_component_field_info,
