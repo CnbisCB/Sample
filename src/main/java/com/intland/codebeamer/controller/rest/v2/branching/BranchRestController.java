@@ -184,7 +184,8 @@ public class BranchRestController extends AbstractUserAwareRestController {
 			checkBranchingPermission();
 			branch = createBranchDto();
 		}
-
+/* CB_COMPONENT_ID: SwDD-001,SwDD-002,SwDD-003 */
+/* CB_SCOPE: Diag_Process */
 		public CreateBranchParameterDto createCreateBranchParameterDto(Set<Integer> involvedTrackerIds, Map<TrackerDto,BranchCreationContext> branches) {
 			return createCreateBranchParameterDto(
 					createCreateBranchParameters(
