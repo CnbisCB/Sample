@@ -7,10 +7,11 @@ from typing import Any, Dict, List, Optional
 import requests
 
 
-COMMENT_COMPONENT_ID_RE = re.compile(r"CB_COMPONENT_ID:\s*([A-Za-z0-9_./-]+)")
+COMMENT_COMPONENT_LINE_RE = re.compile(r"CB_COMPONENT_ID:\s*([^\n\r]+)")
 COMMENT_SCOPE_RE = re.compile(r"CB_SCOPE:\s*([A-Za-z0-9_./-]+)")
+COMPONENT_TOKEN_RE = re.compile(r"[A-Za-z0-9_./-]+")
 SUPPORTED_SUFFIXES = {".java", ".c", ".cpp", ".cc", ".h", ".hpp"}
-ANNOTATION_WINDOW = 6
+ANNOTATION_WINDOW = 8
 
 
 def require_env(name: str) -> str:
@@ -38,6 +39,7 @@ def debug(title: str, data: Any) -> None:
 
 def request(method: str, url: str, auth: tuple[str, str], **kwargs) -> requests.Response:
     response = requests.request(method, url, auth=auth, timeout=60, **kwargs)
+
     print(f"=== {method} {url} - STATUS ===")
     print(response.status_code)
     print(f"=== {method} {url} - BODY ===")
@@ -86,29 +88,44 @@ def is_comment_line(line: str) -> bool:
     )
 
 
+def unique_keep_order(values: List[str]) -> List[str]:
+    seen = set()
+    result = []
+    for value in values:
+        if value not in seen:
+            seen.add(value)
+            result.append(value)
+    return result
+
+
+def parse_component_tokens(raw_value: str) -> List[str]:
+    return unique_keep_order(COMPONENT_TOKEN_RE.findall(raw_value))
+
+
 def find_annotation_at(lines: List[str], start_index: int) -> Optional[Dict[str, Any]]:
-    component_token = None
+    component_tokens: List[str] = []
     scope_name = None
     last_annotation_index = None
 
     for idx in range(start_index, min(start_index + ANNOTATION_WINDOW, len(lines))):
-        component_match = COMMENT_COMPONENT_ID_RE.search(lines[idx])
-        scope_match = COMMENT_SCOPE_RE.search(lines[idx])
-
-        if component_match:
-            component_token = component_match.group(1).strip()
+        component_matches = COMMENT_COMPONENT_LINE_RE.findall(lines[idx])
+        for raw_match in component_matches:
+            component_tokens.extend(parse_component_tokens(raw_match))
             last_annotation_index = idx
 
+        scope_match = COMMENT_SCOPE_RE.search(lines[idx])
         if scope_match:
             scope_name = scope_match.group(1).strip()
             last_annotation_index = idx
 
-        if component_token and scope_name:
-            return {
-                "component_token": component_token,
-                "scope_name": scope_name,
-                "annotation_end_index": last_annotation_index,
-            }
+    component_tokens = unique_keep_order(component_tokens)
+
+    if component_tokens and scope_name:
+        return {
+            "component_tokens": component_tokens,
+            "scope_name": scope_name,
+            "annotation_end_index": last_annotation_index,
+        }
 
     return None
 
@@ -179,7 +196,7 @@ def collect_targets(repo_root: Path) -> List[Dict[str, Any]]:
             if block:
                 found.append(
                     {
-                        "component_token": annotation["component_token"],
+                        "component_tokens": annotation["component_tokens"],
                         "scope_name": annotation["scope_name"],
                         "file_path": relative_path,
                         "start_line": block["start_line"],
@@ -218,8 +235,8 @@ def query_items(auth: tuple[str, str], api_base_url: str, query_string: str) -> 
         "pageSize": 100,
         "queryString": query_string,
     }
-    result = request_json("POST", url, auth=auth, json=body)
 
+    result = request_json("POST", url, auth=auth, json=body)
     if not isinstance(result, dict):
         raise RuntimeError(f"Unexpected query response: {result}")
 
@@ -228,6 +245,21 @@ def query_items(auth: tuple[str, str], api_base_url: str, query_string: str) -> 
         raise RuntimeError(f"Unexpected query items payload: {result}")
 
     return items
+
+
+def get_field_info(
+    auth: tuple[str, str],
+    api_base_url: str,
+    tracker_id: int,
+    field_id: int,
+) -> Dict[str, Any]:
+    url = f"{api_base_url}/trackers/{tracker_id}/fields/{field_id}"
+    result = request_json("GET", url, auth=auth)
+
+    if not isinstance(result, dict):
+        raise RuntimeError(f"Unexpected field info response for field {field_id}: {result}")
+
+    return result
 
 
 def resolve_component_item_id(
@@ -262,6 +294,15 @@ def resolve_component_item_id(
     )
 
 
+def resolve_component_item_ids(
+    auth: tuple[str, str],
+    api_base_url: str,
+    component_tokens: List[str],
+) -> List[int]:
+    resolved_ids = [resolve_component_item_id(auth, api_base_url, token) for token in component_tokens]
+    return unique_keep_order([str(item_id) for item_id in resolved_ids])
+
+
 def find_existing_evidence_item_id(
     auth: tuple[str, str],
     api_base_url: str,
@@ -286,7 +327,93 @@ def find_existing_evidence_item_id(
     return int(items[0]["id"])
 
 
-def build_create_custom_fields(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+def build_text_field_value(field_id: int, field_name: str, value: str) -> Dict[str, Any]:
+    return {
+        "fieldId": field_id,
+        "name": field_name,
+        "type": "TextFieldValue",
+        "value": value,
+    }
+
+
+def build_integer_field_value(field_id: int, field_name: str, value: int) -> Dict[str, Any]:
+    return {
+        "fieldId": field_id,
+        "name": field_name,
+        "type": "IntegerFieldValue",
+        "value": value,
+    }
+
+
+def build_url_field_value(
+    tracker_id: int,
+    field_info: Dict[str, Any],
+    url_value: str,
+) -> Dict[str, Any]:
+    value_model = field_info.get("valueModel")
+    if value_model != "UrlFieldValue":
+        raise RuntimeError(
+            f"Field {field_info.get('id')} ({field_info.get('name')}) in tracker {tracker_id} "
+            f"is not a Url field. Current valueModel={value_model}. "
+            "Please configure the Permalink field as Url/Hyperlink field in Codebeamer."
+        )
+
+    return {
+        "fieldId": int(field_info["id"]),
+        "name": field_info["name"],
+        "type": "UrlFieldValue",
+        "value": url_value,
+    }
+
+
+def build_linked_component_field_value(
+    tracker_id: int,
+    field_info: Dict[str, Any],
+    component_item_ids: List[int],
+) -> Dict[str, Any]:
+    value_model = field_info.get("valueModel", "")
+    reference_type = field_info.get("referenceType")
+    multiple_values = bool(field_info.get("multipleValues", False))
+
+    if not str(value_model).startswith("ChoiceFieldValue"):
+        raise RuntimeError(
+            f"Field {field_info.get('id')} ({field_info.get('name')}) in tracker {tracker_id} "
+            f"does not accept ChoiceFieldValue. Current valueModel={value_model}"
+        )
+
+    if reference_type != "TrackerItemReference":
+        raise RuntimeError(
+            f"Field {field_info.get('id')} ({field_info.get('name')}) in tracker {tracker_id} "
+            f"is not a TrackerItem reference field. referenceType={reference_type}"
+        )
+
+    if len(component_item_ids) > 1 and not multiple_values:
+        raise RuntimeError(
+            f"Linked Component field {field_info.get('id')} ({field_info.get('name')}) "
+            "is not configured as multi-value, but multiple CB_COMPONENT_ID values were found."
+        )
+
+    return {
+        "fieldId": int(field_info["id"]),
+        "name": field_info["name"],
+        "type": "ChoiceFieldValue",
+        "values": [
+            {
+                "id": int(component_item_id),
+                "name": str(component_item_id),
+                "type": "TrackerItemReference",
+            }
+            for component_item_id in component_item_ids
+        ],
+    }
+
+
+def build_custom_fields_for_create(
+    auth: tuple[str, str],
+    api_base_url: str,
+    tracker_id: int,
+    data: Dict[str, Any],
+) -> List[Dict[str, Any]]:
     field_repository = resolve_field_id("CB_FIELD_REPOSITORY")
     field_file_path = resolve_field_id("CB_FIELD_FILE_PATH")
     field_start_line = resolve_field_id("CB_FIELD_START_LINE")
@@ -295,76 +422,51 @@ def build_create_custom_fields(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     field_permalink = resolve_field_id("CB_FIELD_PERMALINK")
     field_linked_component = resolve_field_id("CB_FIELD_LINKED_COMPONENT")
 
+    permalink_field_info = get_field_info(auth, api_base_url, tracker_id, field_permalink)
+    linked_component_field_info = get_field_info(auth, api_base_url, tracker_id, field_linked_component)
+
     custom_fields: List[Dict[str, Any]] = [
-        {
-            "fieldId": field_repository,
-            "name": "Repository Name",
-            "type": "TextFieldValue",
-            "value": data["repository"],
-        },
-        {
-            "fieldId": field_file_path,
-            "name": "File Path",
-            "type": "TextFieldValue",
-            "value": data["file_path"],
-        },
-        {
-            "fieldId": field_start_line,
-            "name": "Start Line",
-            "type": "IntegerFieldValue",
-            "value": data["start_line"],
-        },
-        {
-            "fieldId": field_end_line,
-            "name": "End Line",
-            "type": "IntegerFieldValue",
-            "value": data["end_line"],
-        },
-        {
-            "fieldId": field_commit_sha,
-            "name": "Commit SHA",
-            "type": "TextFieldValue",
-            "value": data["commit_sha"],
-        },
-        {
-            "fieldId": field_permalink,
-            "name": "GitHub Permalink",
-            "type": "TextFieldValue",
-            "value": data["permalink"],
-        },
-        {
-            "fieldId": field_linked_component,
-            "name": "Linked Component",
-            "type": "ChoiceFieldValue",
-            "values": [
-                {
-                    "id": data["component_item_id"],
-                    "name": str(data["component_item_id"]),
-                    "type": "TrackerItemReference",
-                }
-            ],
-        },
+        build_text_field_value(field_repository, "Repository Name", data["repository"]),
+        build_text_field_value(field_file_path, "File Path", data["file_path"]),
+        build_integer_field_value(field_start_line, "Start Line", data["start_line"]),
+        build_integer_field_value(field_end_line, "End Line", data["end_line"]),
+        build_text_field_value(field_commit_sha, "Commit SHA", data["commit_sha"]),
+        build_url_field_value(tracker_id, permalink_field_info, data["permalink"]),
+        build_linked_component_field_value(
+            tracker_id,
+            linked_component_field_info,
+            data["component_item_ids"],
+        ),
     ]
 
     raw_scope_field_id = optional_env("CB_FIELD_SCOPE_NAME")
     if raw_scope_field_id:
         scope_field_id = int(raw_scope_field_id)
         if scope_field_id == 3:
-            print("CB_FIELD_SCOPE_NAME=3 detected. Field 3 is Summary, so separate scope field create is skipped.")
+            print("CB_FIELD_SCOPE_NAME=3 detected. Field 3 is Summary/Name, so separate scope field create is skipped.")
         else:
+            scope_field_info = get_field_info(auth, api_base_url, tracker_id, scope_field_id)
             custom_fields.append(
-                {
-                    "fieldId": scope_field_id,
-                    "name": "Scope Name",
-                    "type": "TextFieldValue",
-                    "value": data["scope_name"],
-                }
+                build_text_field_value(scope_field_id, scope_field_info["name"], data["scope_name"])
             )
+
+    raw_component_name_field_id = optional_env("CB_FIELD_COMPONENT_NAME")
+    if raw_component_name_field_id:
+        component_name_field_id = int(raw_component_name_field_id)
+        component_name_field_info = get_field_info(auth, api_base_url, tracker_id, component_name_field_id)
+        custom_fields.append(
+            build_text_field_value(component_name_field_id, component_name_field_info["name"], data["scope_name"])
+        )
 
     return custom_fields
 
 
-def build_update_field_values(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+def build_field_values_for_update(
+    auth: tuple[str, str],
+    api_base_url: str,
+    tracker_id: int,
+    data: Dict[str, Any],
+) -> List[Dict[str, Any]]:
     field_repository = resolve_field_id("CB_FIELD_REPOSITORY")
     field_file_path = resolve_field_id("CB_FIELD_FILE_PATH")
     field_start_line = resolve_field_id("CB_FIELD_START_LINE")
@@ -373,71 +475,41 @@ def build_update_field_values(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     field_permalink = resolve_field_id("CB_FIELD_PERMALINK")
     field_linked_component = resolve_field_id("CB_FIELD_LINKED_COMPONENT")
 
+    permalink_field_info = get_field_info(auth, api_base_url, tracker_id, field_permalink)
+    linked_component_field_info = get_field_info(auth, api_base_url, tracker_id, field_linked_component)
+
     field_values: List[Dict[str, Any]] = [
-        {
-            "fieldId": field_repository,
-            "name": "Repository Name",
-            "type": "TextFieldValue",
-            "value": data["repository"],
-        },
-        {
-            "fieldId": field_file_path,
-            "name": "File Path",
-            "type": "TextFieldValue",
-            "value": data["file_path"],
-        },
-        {
-            "fieldId": field_start_line,
-            "name": "Start Line",
-            "type": "IntegerFieldValue",
-            "value": data["start_line"],
-        },
-        {
-            "fieldId": field_end_line,
-            "name": "End Line",
-            "type": "IntegerFieldValue",
-            "value": data["end_line"],
-        },
-        {
-            "fieldId": field_commit_sha,
-            "name": "Commit SHA",
-            "type": "TextFieldValue",
-            "value": data["commit_sha"],
-        },
-        {
-            "fieldId": field_permalink,
-            "name": "GitHub Permalink",
-            "type": "TextFieldValue",
-            "value": data["permalink"],
-        },
-        {
-            "fieldId": field_linked_component,
-            "name": "Linked Component",
-            "type": "ChoiceFieldValue",
-            "values": [
-                {
-                    "id": data["component_item_id"],
-                    "name": str(data["component_item_id"]),
-                    "type": "TrackerItemReference",
-                }
-            ],
-        },
+        build_text_field_value(field_repository, "Repository Name", data["repository"]),
+        build_text_field_value(field_file_path, "File Path", data["file_path"]),
+        build_integer_field_value(field_start_line, "Start Line", data["start_line"]),
+        build_integer_field_value(field_end_line, "End Line", data["end_line"]),
+        build_text_field_value(field_commit_sha, "Commit SHA", data["commit_sha"]),
+        build_url_field_value(tracker_id, permalink_field_info, data["permalink"]),
+        build_linked_component_field_value(
+            tracker_id,
+            linked_component_field_info,
+            data["component_item_ids"],
+        ),
     ]
 
     raw_scope_field_id = optional_env("CB_FIELD_SCOPE_NAME")
     if raw_scope_field_id:
         scope_field_id = int(raw_scope_field_id)
         if scope_field_id == 3:
-            print("CB_FIELD_SCOPE_NAME=3 detected. Field 3 is Summary, so separate scope field update is skipped.")
+            print("CB_FIELD_SCOPE_NAME=3 detected. Field 3 is Summary/Name, so separate scope field update is skipped.")
         else:
+            scope_field_info = get_field_info(auth, api_base_url, tracker_id, scope_field_id)
             field_values.append(
-                {
-                    "fieldId": scope_field_id,
-                    "name": "Scope Name",
-                    "type": "TextFieldValue",
-                    "value": data["scope_name"],
-                }
+                build_text_field_value(scope_field_id, scope_field_info["name"], data["scope_name"])
             )
+
+    raw_component_name_field_id = optional_env("CB_FIELD_COMPONENT_NAME")
+    if raw_component_name_field_id:
+        component_name_field_id = int(raw_component_name_field_id)
+        component_name_field_info = get_field_info(auth, api_base_url, tracker_id, component_name_field_id)
+        field_values.append(
+            build_text_field_value(component_name_field_id, component_name_field_info["name"], data["scope_name"])
+        )
 
     return field_values
 
@@ -453,7 +525,7 @@ def create_evidence_item(
         "name": data["evidence_name"],
         "description": "Generated by GitHub Actions",
         "descriptionFormat": "PlainText",
-        "customFields": build_create_custom_fields(data),
+        "customFields": build_custom_fields_for_create(auth, api_base_url, tracker_id, data),
     }
 
     debug("CREATE URL", url)
@@ -469,12 +541,13 @@ def create_evidence_item(
 def update_evidence_item_fields(
     auth: tuple[str, str],
     api_base_url: str,
+    tracker_id: int,
     item_id: int,
     data: Dict[str, Any],
 ) -> None:
     url = f"{api_base_url}/items/{item_id}/fields"
     payload = {
-        "fieldValues": build_update_field_values(data)
+        "fieldValues": build_field_values_for_update(auth, api_base_url, tracker_id, data)
     }
 
     debug("UPDATE FIELDS URL", url)
@@ -483,9 +556,16 @@ def update_evidence_item_fields(
     request_json("PUT", url, auth=auth, json=payload)
 
 
-def has_linked_component(item_data: Any, linked_field_id: int, component_item_id: int) -> bool:
+def has_all_linked_components(
+    item_data: Any,
+    linked_field_id: int,
+    component_item_ids: List[int],
+) -> bool:
     if not isinstance(item_data, dict):
         return False
+
+    expected_ids = {int(x) for x in component_item_ids}
+    actual_ids = set()
 
     custom_fields = item_data.get("customFields", [])
     for field in custom_fields:
@@ -493,25 +573,25 @@ def has_linked_component(item_data: Any, linked_field_id: int, component_item_id
             continue
 
         for value in field.get("values", []):
-            if int(value.get("id", -1)) == component_item_id:
-                return True
+            actual_ids.add(int(value.get("id", -1)))
 
-    return False
+    return expected_ids.issubset(actual_ids)
 
 
 def verify_item(
     auth: tuple[str, str],
     api_base_url: str,
     item_id: int,
-    component_item_id: int,
+    component_item_ids: List[int],
 ) -> None:
     linked_field_id = resolve_field_id("CB_FIELD_LINKED_COMPONENT")
     item_data = get_item(auth, api_base_url, item_id)
     debug("VERIFY ITEM RESPONSE", item_data)
 
-    if not has_linked_component(item_data, linked_field_id, component_item_id):
+    if not has_all_linked_components(item_data, linked_field_id, component_item_ids):
         raise RuntimeError(
-            f"Linked Component verification failed. item_id={item_id}, component_item_id={component_item_id}"
+            "Linked Component verification failed. "
+            f"item_id={item_id}, component_item_ids={component_item_ids}"
         )
 
 
@@ -543,8 +623,8 @@ def main() -> None:
     updated_count = 0
 
     for target in targets:
-        component_item_id = resolve_component_item_id(auth, api_base_url, target["component_token"])
-        evidence_name = f'{target["scope_name"]} @ {target["file_path"]}'
+        component_item_ids = [int(x) for x in resolve_component_item_ids(auth, api_base_url, target["component_tokens"])]
+
         permalink = build_permalink(
             server_url=server_url,
             repository=repository,
@@ -555,7 +635,7 @@ def main() -> None:
         )
 
         payload_data = {
-            "component_item_id": component_item_id,
+            "component_item_ids": component_item_ids,
             "scope_name": target["scope_name"],
             "file_path": target["file_path"],
             "start_line": target["start_line"],
@@ -563,7 +643,7 @@ def main() -> None:
             "repository": repository,
             "commit_sha": sha,
             "permalink": permalink,
-            "evidence_name": evidence_name,
+            "evidence_name": target["scope_name"],
         }
 
         debug("PROCESSING TARGET", payload_data)
@@ -572,7 +652,7 @@ def main() -> None:
             auth=auth,
             api_base_url=api_base_url,
             tracker_id=tracker_id,
-            evidence_name=evidence_name,
+            evidence_name=payload_data["evidence_name"],
         )
 
         if existing_item_id is None:
@@ -583,23 +663,24 @@ def main() -> None:
                 data=payload_data,
             )
             created_count += 1
-            print(f"CREATED: {item_id} / {evidence_name}")
+            print(f"CREATED: {item_id} / {payload_data['evidence_name']}")
         else:
             update_evidence_item_fields(
                 auth=auth,
                 api_base_url=api_base_url,
+                tracker_id=tracker_id,
                 item_id=existing_item_id,
                 data=payload_data,
             )
             item_id = existing_item_id
             updated_count += 1
-            print(f"UPDATED: {item_id} / {evidence_name}")
+            print(f"UPDATED: {item_id} / {payload_data['evidence_name']}")
 
         verify_item(
             auth=auth,
             api_base_url=api_base_url,
             item_id=item_id,
-            component_item_id=component_item_id,
+            component_item_ids=component_item_ids,
         )
 
     print("=== SYNC RESULT ===")
